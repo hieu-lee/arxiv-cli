@@ -128,7 +128,7 @@ pub fn expr(field: &str, text: &str) -> String {
 }
 
 /// arXiv has no unary NOT: `NOT x` must follow a positive term (use --not for pure exclusions).
-fn check_negation(text: &str) -> Result<(), String> {
+pub(crate) fn check_negation(text: &str) -> Result<(), String> {
     let mut prev_operand = false;
     for t in toks(text) {
         match t.to_ascii_uppercase().as_str() {

@@ -40,6 +40,9 @@ pub struct Paper {
     pub insts: Vec<String>,
     /// Enrichment already attempted: bit 1 = insts, bit 2 = msc (so display never refetches).
     pub enriched: u8,
+    /// Provenance gaps of substitute sources (OpenAlex): bit 1 = no arXiv categories/comments,
+    /// bit 2 = author list (and so institutions) truncated. 0 for papers read from arXiv itself.
+    pub partial: u8,
 }
 
 impl Paper {

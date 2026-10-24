@@ -78,7 +78,7 @@ fn script_text(rest: &[String]) -> String {
         };
         match name {
             "fresh" => {}
-            "par" | "rate" | "ttl" | "qfile" => {
+            "par" | "rate" | "ttl" | "qfile" | "via" => {
                 if !inline {
                     it.next();
                 }
@@ -328,6 +328,15 @@ async fn alerts(net: &Arc<Net>, a: &Args) -> Result<Out, String> {
             }
         }
     }
+    // stale or substitute data (cache past its TTL, OpenAlex) may lack papers: never advance a cursor over it
+    let cursors = if net.degraded() {
+        if !cursors.is_empty() {
+            s.push_str("(alert cursors not advanced: results came from stale or fallback sources)\n");
+        }
+        Vec::new()
+    } else {
+        cursors
+    };
     Ok(Out { papers: shown, text: s.trim_end().to_string(), failed, cursors, ..Default::default() })
 }
 
@@ -379,7 +388,7 @@ fn outer_tokens(toks: &[String]) -> Vec<String> {
             continue;
         }
         out.push(t.clone());
-        let takes_value = matches!(t.as_str(), "--par" | "--rate" | "--ttl" | "--qfile" | "-j");
+        let takes_value = matches!(t.as_str(), "--par" | "--rate" | "--ttl" | "--qfile" | "--via" | "-j");
         if takes_value {
             if let Some(v) = it.next() {
                 out.push(v.clone());
@@ -396,7 +405,7 @@ pub fn engine_flags(toks: &[String]) -> Args {
     collect_flags(toks, 0, &mut found);
     let mut a = Args::default();
     for (f, v) in found {
-        if matches!(f.name, "fresh" | "par" | "rate" | "ttl" | "qfile") {
+        if matches!(f.name, "fresh" | "par" | "rate" | "ttl" | "qfile" | "via") {
             a.kv.push((f.name, v));
         }
     }

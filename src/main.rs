@@ -3,14 +3,17 @@ mod atom;
 mod cmd;
 mod dates;
 mod engine;
+mod fallback;
 mod filter;
 mod fuzzy;
 mod help;
 mod html;
 mod model;
 mod net;
+mod openalex;
 mod out;
 mod pipe;
+mod pstore;
 mod query;
 mod store;
 mod tags;
@@ -98,6 +101,10 @@ fn real_main() -> i32 {
             }
         };
         let (text, ok, cursors) = pipe::run_batch(&net, &argv).await;
+        // where the answer came from when it was degraded (stale cache, OpenAlex, cooling hosts)
+        for n in net.take_notes() {
+            let _ = writeln!(std::io::stderr().lock(), "(note: {n})");
+        }
         let to_err = text.starts_with("error: ");
         let written = if to_err { writeln!(std::io::stderr().lock(), "{text}") } else { writeln!(std::io::stdout().lock(), "{text}") };
         if let Err(e) = written {

@@ -188,6 +188,9 @@ async fn papers_for(net: &Net, a: &Args, input: Input) -> Result<(Vec<Paper>, Op
         }
     }
     if filter.any() {
+        for p in &papers {
+            filter.check_provenance(p)?;
+        }
         papers.retain_mut(|p| filter.pass_meta(p));
         engine::enrich(net, &mut papers, filter.needs_insts(), filter.needs_msc()).await?;
         papers.retain(|p| filter.pass_enriched(p));
@@ -195,6 +198,9 @@ async fn papers_for(net: &Net, a: &Args, input: Input) -> Result<(Vec<Paper>, Op
     // explicit date ordering applies to piped / id lists too, before skip and -n
     if let Some(sort) = a.get("sort") {
         let (by, order) = query::parse_sort(sort)?;
+        if by == "lastUpdatedDate" && papers.iter().any(|p| p.partial & 1 != 0) {
+            return Err("--sort upd needs arXiv update dates, which OpenAlex-sourced papers lack (retry when arXiv is reachable)".into());
+        }
         engine::sort_local(&mut papers, by, order);
     }
     let skip = a.num::<usize>("skip").unwrap_or(0);
@@ -303,18 +309,15 @@ async fn load_tex(net: &Net, id: &str) -> Result<Option<DocData>, String> {
     Ok(Some(DocData { title: String::new(), text: t, sections, items, refs, is_tex: true }))
 }
 
-/// `--src html` (default, falls back to tex when no HTML exists) or `--src tex`.
+/// `--src html` (default: arxiv.org/html, then ar5iv for older papers) or `--src tex`. The e-print source
+/// is opt-in only: arXiv's robots.txt asks automated agents not to fetch /e-print, so it is used solely
+/// when explicitly requested for a paper, never as a silent fallback.
 pub async fn load_doc(net: &Net, id: &str, a: &Args) -> Result<DocData, String> {
-    let want_tex = a.get("src") == Some("tex");
-    let d = if want_tex {
-        load_tex(net, id).await?
-    } else {
-        match load_html(net, id).await? {
-            Some(d) => Some(d),
-            None => load_tex(net, id).await?,
-        }
-    };
-    d.ok_or_else(|| format!("{id}: no HTML or TeX source available"))
+    if a.get("src") == Some("tex") {
+        net.note("TeX source fetched from arxiv.org/e-print on request (robots.txt discourages bulk automated use; cached afterwards)");
+        return load_tex(net, id).await?.ok_or_else(|| format!("{id}: no TeX source available"));
+    }
+    load_html(net, id).await?.ok_or_else(|| format!("{id}: no HTML version (older paper?); `--src tex` fetches the TeX source instead"))
 }
 
 /// Run `f` over every id concurrently; results in input order, errors inlined as text.

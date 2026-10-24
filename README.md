@@ -36,7 +36,7 @@ arx watch graphs 'ramsey' -c math.CO ; arx alerts              # saved queries; 
 |---|---|
 | `search` (default) | query + all filters |
 | `get`, `bib`, `com` | metadata, BibTeX, author comments |
-| `prob` | theorem-like blocks (open problems, conjectures, theorems, ...) from full text, HTML first, TeX source fallback |
+| `prob` | theorem-like blocks (open problems, conjectures, theorems, ...) from full text (HTML, ar5iv for older papers; `--src tex` fetches the e-print source on request) |
 | `text`, `outline`, `sec`, `grep`, `refs` | full text as Markdown, sections, one section, passage search, bibliography |
 | `cites`, `related`, `ver`, `dl` | citing papers (Semantic Scholar), similar papers, version history, downloads |
 | `cats`, `tags`, `venue` | category taxonomy, topic presets, journal/conference quartiles |
@@ -50,6 +50,17 @@ Server-side (fast): text/`--ti`/`--abs`/`--kw`/`--not`/`--co`/`--jr`, `--au`, `-
 Client-side (over-fetching, concurrent enrichment): fuzzy author (accents, initials, particles, compound surnames), institution (`--inst`, from the full-text author block), `--published` / `--preprint` / `--accepted`, journal quartile `--q 1-2` (bundled, approximate SJR-style table plus CORE-mapped conferences; extend with `--qfile`), `--jn`, `--cmt`, `--pages`, `--nau`, `--msc`, `--pcat`, `--doi`.
 
 Rules: comma inside a flag = OR, repeating a flag = AND. Dates: `2024`, `2024-03`, `2024-03-05`, `30d`, `6m`, `2y`.
+
+## Rate limits
+
+arXiv asks for one API connection at a time, three seconds apart. `arx` never exceeds that, and is built so you rarely wait for it:
+
+* **Fewer calls**: results come in fixed, aligned 100-row pages, so `-n 5`, `-n 50` and `--skip 5` of one query share a single cached response; every paper seen is also kept in a per-paper store, so `get`, `related` and piped lookups usually need no API call at all.
+* **Fail fast, never hammer**: HTTP 429, timeouts and outages open a cooldown (honouring `Retry-After`, else 30 s doubling to 15 min) shared by all arx processes, instead of retry loops.
+* **Stale beats nothing**: while a host is cooling down, expired cache entries are served (a `(note: ...)` line on stderr says so).
+* **No bypass**: the 3 s spacing and single connection are a floor (`--rate` cannot go below it). arXiv's terms forbid circumventing its rate limits, so there is no proxying, IP/user-agent rotation or parallel API connections: the answer to throttling is to ask arXiv less often and to use other legitimate sources.
+* **Other sources**: when arXiv is unavailable, `get`/`related` metadata and text searches (words, authors, date range) are answered by OpenAlex, including author institutions. It has no arXiv categories or comments, so category/tag/field-scoped queries (`--cat`, `--tag`, `--ti`, `--abs`, `--cmt`, `--pages`, ...) wait for the cache instead, and dates of OpenAlex-sourced papers are the arXiv id's month. Results from stale or substitute sources never advance `alerts` cursors. Author institutions (`--inst`) are read from OpenAlex first (50 papers per request) and only scraped from arxiv.org pages for papers it lacks. Set `ARX_OPENALEX_KEY` (free key) for more OpenAlex budget (`ARX_MAILTO` only identifies the client).
+* **Control**: `--via cache` never touches the network (cached OpenAlex answers count), `--via oa` uses OpenAlex only, `--via api` arXiv only, `--fresh` skips fresh-cache reads (stale entries still rescue a failing request).
 
 ## Versus arxiv-mcp-server
 

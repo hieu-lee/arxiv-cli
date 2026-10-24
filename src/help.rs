@@ -71,7 +71,7 @@ pub fn topic(cmd: &str) -> String {
     let t = match cmd {
         "search" => "search: arx [search] [TEXT] [-a AUTHOR] [-c CAT] [-t TAG] [--since D] [-n N] [filters] [--facet cat,year]\n  e.g. arx -a 'erdos' --preprint --since 5y; arx 'functional equation' -c math.CA --q 1 --inst mit",
         "get" => "get: arx get ID.. [-f fields] [--fmt json|bib|tsv]  (ids may be URLs/arXiv:ids)",
-        "prob" => "prob: arx prob ID..|QUERY [--kind prob,conj,q,thm,lem,def,all] [-m N] [-g PAT] [--src tex]  HTML first, TeX source fallback",
+        "prob" => "prob: arx prob ID..|QUERY [--kind prob,conj,q,thm,lem,def,all] [-m N] [-g PAT] [--src tex]  HTML (ar5iv for older papers); --src tex fetches the e-print source on request",
         "text" => "text: arx text ID [--sec 2.1|title] [--tok N] [--skip CHARS] [--src tex]",
         "watch" => "watch: arx watch NAME <search args>; arx alerts [NAME] [--peek]",
         "x" => "x: arx x 'STMT ; STMT | STAGE'  parallel statements, piped stages (--keep prints a middle stage). `-` reads stdin",

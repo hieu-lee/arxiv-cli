@@ -229,6 +229,18 @@ impl Filter {
     pub fn needs_msc(&self) -> bool {
         !self.msc.is_empty()
     }
+    /// Error when `p` comes from a substitute source (OpenAlex) that lacks data an active filter depends on,
+    /// instead of silently treating "unknown" as "does not match".
+    pub fn check_provenance(&self, p: &Paper) -> Result<(), String> {
+        if p.partial & 1 != 0 && (!self.cmt.is_empty() || self.pages.is_some() || !self.pcat.is_empty() || self.preprint || self.accepted) {
+            return Err("--cmt/--pages/--pcat/--preprint/--accepted need arXiv metadata (categories, author comments) that the substitute source (OpenAlex) lacks; retry when arXiv is reachable (--via api) or use cached data (--via cache)".into());
+        }
+        if p.partial & 2 != 0 && (self.nau.is_some() || !self.au.is_empty()) {
+            return Err("--nau/--au: the substitute source (OpenAlex) truncates author lists at 100".into());
+        }
+        Ok(())
+    }
+
     /// Any client-side filter active at all (decides whether we must over-fetch).
     pub fn any(&self) -> bool {
         !(self.au.is_empty() && self.inst.is_empty() && self.jn.is_empty() && self.cmt.is_empty() && self.msc.is_empty() && self.pcat.is_empty())
@@ -404,6 +416,22 @@ mod tests {
         assert!(!f(&["--jn", "Physical Review A"]).pass_meta(&mut p));
         let mut q = Paper { jref: Some("Phys. Rev. A 105, 022411 (2022)".into()), ..Default::default() };
         assert!(f(&["--jn", "Physical Review A"]).pass_meta(&mut q));
+    }
+
+    #[test]
+    fn substitute_source_papers_cannot_satisfy_arxiv_only_filters() {
+        let f = |args: &[&str]| Filter::from_args(&crate::args::parse(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()).unwrap();
+        let oa = Paper { partial: 1, ..Default::default() };
+        assert!(f(&["--cmt", "x"]).check_provenance(&oa).is_err());
+        assert!(f(&["--pages", "10-"]).check_provenance(&oa).is_err());
+        assert!(f(&["--pcat", "math.*"]).check_provenance(&oa).is_err());
+        assert!(f(&["--accepted"]).check_provenance(&oa).is_err());
+        assert!(f(&["--published"]).check_provenance(&oa).is_ok());
+        assert!(f(&["--nau", "3"]).check_provenance(&oa).is_ok());
+        assert!(f(&["--nau", "3"]).check_provenance(&Paper { partial: 3, ..Default::default() }).is_err());
+        assert!(f(&["--au", "tao"]).check_provenance(&Paper { partial: 3, ..Default::default() }).is_err());
+        assert!(f(&["--au", "tao"]).check_provenance(&oa).is_ok());
+        assert!(f(&["--cmt", "x"]).check_provenance(&Paper::default()).is_ok());
     }
 
     #[test]
