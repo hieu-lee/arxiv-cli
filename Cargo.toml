@@ -1,0 +1,26 @@
+[package]
+name = "arx"
+version = "0.1.0"
+edition = "2021"
+description = "Token-efficient, concurrent arXiv CLI built for LLM agents"
+license = "MIT"
+
+[[bin]]
+name = "arx"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "http2"] }
+serde_json = "1"
+flate2 = "1"
+tar = "0.4"
+mimalloc = "0.1"
+futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

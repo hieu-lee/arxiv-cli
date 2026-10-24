@@ -1,0 +1,613 @@
+# arx venue table. Columns: name<TAB>q<TAB>area<TAB>alias;alias;...
+# q = APPROXIMATE best-quartile (1..4) in Scimago SJR (~2023 data, math/TCS/physics/stat/AI categories), written from memory, not an official export.
+# Conferences (area=conf) derive q from CORE rank: A*/A -> 1, B -> 2, C -> 3. Borderline journals: the more likely quartile was chosen.
+# Alias syntax: names/aliases are matched as whole-token sequences after folding (case, diacritics, punctuation, of/the/and, common abbreviations).
+# Prefix '^' = ambiguous English phrase, only matches when capitalised and followed by a number (volume) or in a "published in" context.
+# Prefix '!' = single-token alias that is safe to match alone. Unprefixed single tokens need >=5 chars and a following number, or ALLCAPS acronyms (>=3 letters).
+Annals of Mathematics	1	math	
+Acta Mathematica	1	math	
+Journal of the American Mathematical Society	1	math	JAMS
+Inventiones Mathematicae	1	math	Invent. Math.
+Duke Mathematical Journal	1	math	
+Publications Mathématiques de l'IHÉS	1	math	Publ. Math. IHES;Publ. Math. Inst. Hautes Études Sci.;Publications Mathématiques de l'Institut des Hautes Études Scientifiques
+Forum of Mathematics, Pi	1	math	Forum Math. Pi
+Forum of Mathematics, Sigma	1	math	Forum Math. Sigma
+Annales Scientifiques de l'École Normale Supérieure	1	math	Ann. Sci. Éc. Norm. Supér.;Ann. Sci. Ecole Norm. Sup.;Ann. Sci. Ec. Norm. Sup.
+Journal für die reine und angewandte Mathematik	1	math	J. Reine Angew. Math.;Crelle's Journal;!Crelle
+Mathematische Annalen	1	math	
+Advances in Mathematics	1	math	
+Compositio Mathematica	1	math	Compos. Math.
+Geometry & Topology	1	math.geom	
+Analysis & PDE	1	math.anal	
+Journal of the European Mathematical Society	1	math	JEMS
+Journal of Differential Geometry	1	math.geom	
+Geometric and Functional Analysis	1	math.anal	GAFA
+Communications on Pure and Applied Mathematics	1	math	CPAM
+Memoirs of the American Mathematical Society	1	math	Mem. AMS
+American Journal of Mathematics	1	math	
+Selecta Mathematica	1	math	
+Mathematische Zeitschrift	1	math	
+Transactions of the American Mathematical Society	1	math	Trans. AMS;Transactions of the AMS
+Transactions of the American Mathematical Society, Series B	1	math	Trans. AMS Ser. B
+Proceedings of the American Mathematical Society	1	math	Proc. AMS;Proceedings of the AMS
+Proceedings of the American Mathematical Society, Series B	1	math	Proc. AMS Ser. B
+Bulletin of the American Mathematical Society	1	math	Bull. AMS
+Notices of the American Mathematical Society	2	math.edu	Notices AMS;Notices of the AMS;Not. Amer. Math. Soc.
+Journal of the London Mathematical Society	1	math	J. LMS
+Proceedings of the London Mathematical Society	1	math	Proc. LMS
+Bulletin of the London Mathematical Society	1	math	Bull. LMS
+Transactions of the London Mathematical Society	2	math	Trans. LMS
+Quarterly Journal of Mathematics	2	math	Quart. J. Math. Oxford
+Mathematical Proceedings of the Cambridge Philosophical Society	2	math	Math. Proc. Camb. Phil. Soc.
+Journal of the Institute of Mathematics of Jussieu	1	math	
+Annales de l'Institut Fourier	1	math	
+Annales de l'Institut Henri Poincaré, Probabilités et Statistiques	1	math.prob	Ann. Inst. H. Poincaré Probab. Statist.
+Annales de l'Institut Henri Poincaré C, Analyse Non Linéaire	1	math.anal	Ann. Inst. H. Poincaré C Anal. Non Linéaire;Ann. Inst. H. Poincaré Anal. Non Linéaire;Ann. Inst. Henri Poincaré Anal. Non Linéaire
+Annales Henri Poincaré	1	math.phys	
+Annales de la Faculté des Sciences de Toulouse	2	math	Ann. Fac. Sci. Toulouse Math.;Ann. Fac. Sci. Toulouse
+Journal de Mathématiques Pures et Appliquées	1	math	J. Math. Pures Appl.
+Commentarii Mathematici Helvetici	1	math	
+Journal d'Analyse Mathématique	1	math.anal	
+Israel Journal of Mathematics	1	math	
+Mathematika	1	math	!Mathematika
+Pacific Journal of Mathematics	2	math	
+Michigan Mathematical Journal	2	math	
+Illinois Journal of Mathematics	2	math	
+Indiana University Mathematics Journal	1	math	
+Rocky Mountain Journal of Mathematics	3	math	
+Houston Journal of Mathematics	3	math	
+Tohoku Mathematical Journal	2	math	
+Osaka Journal of Mathematics	2	math	
+Kyoto Journal of Mathematics	1	math	
+Nagoya Mathematical Journal	1	math	
+Hokkaido Mathematical Journal	3	math	
+Tokyo Journal of Mathematics	3	math	
+Journal of the Mathematical Society of Japan	1	math	
+Publications of the Research Institute for Mathematical Sciences	1	math	PRIMS
+Kodai Mathematical Journal	3	math	
+Japanese Journal of Mathematics	2	math	Jpn. J. Math.
+Proceedings of the Japan Academy, Series A	3	math	
+Hiroshima Mathematical Journal	3	math	
+Acta Mathematica Hungarica	2	math	
+Acta Mathematica Scientia	2	math	
+Acta Mathematica Sinica, English Series	3	math	Acta Math. Sin. Engl. Ser.
+Acta Mathematicae Applicatae Sinica, English Series	3	math	Acta Math. Appl. Sin. Engl. Ser.
+Acta Applicandae Mathematicae	2	math	
+Acta Arithmetica	2	math.nt	
+Acta Scientiarum Mathematicarum	3	math	Acta Sci. Math. (Szeged)
+Studia Mathematica	2	math	
+Fundamenta Mathematicae	2	math.logic	
+Colloquium Mathematicum	3	math	
+Annales Polonici Mathematici	3	math	
+Monatshefte für Mathematik	2	math	
+Archiv der Mathematik	2	math	
+Abhandlungen aus dem Mathematischen Seminar der Universität Hamburg	2	math	Abh. Math. Semin. Univ. Hambg.
+Manuscripta Mathematica	2	math	
+Mathematica Scandinavica	3	math	
+Arkiv för Matematik	2	math	
+Glasgow Mathematical Journal	2	math	
+Proceedings of the Edinburgh Mathematical Society	2	math	
+Proceedings of the Royal Society of Edinburgh Section A	2	math	Proc. Roy. Soc. Edinburgh Sect. A
+Bulletin of the Australian Mathematical Society	2	math	
+Journal of the Australian Mathematical Society	3	math	
+Canadian Journal of Mathematics	1	math	
+Canadian Mathematical Bulletin	2	math	
+The Ramanujan Journal	2	math.nt	
+Indagationes Mathematicae	2	math	
+Results in Mathematics	2	math	
+Aequationes Mathematicae	2	math	
+Annali di Matematica Pura ed Applicata	1	math	Ann. Mat. Pura Appl.
+Annali della Scuola Normale Superiore di Pisa, Classe di Scienze	1	math	Ann. Sc. Norm. Super. Pisa Cl. Sci.
+Rendiconti del Circolo Matematico di Palermo	2	math	
+Revista Matemática Iberoamericana	1	math	
+Publicacions Matemàtiques	2	math	
+Collectanea Mathematica	2	math	
+Mathematical Inequalities & Applications	2	math	
+Journal of Inequalities and Applications	2	math	
+Journal of Mathematical Analysis and Applications	1	math.anal	
+Mathematische Nachrichten	2	math	Math. Nachr.
+Mathematical Methods in the Applied Sciences	2	math.num	Math. Methods Appl. Sci.
+Expositiones Mathematicae	2	math	Exposition. Math.
+Bulletin des Sciences Mathématiques	2	math	
+Documenta Mathematica	1	math	
+Moscow Mathematical Journal	2	math	Mosc. Math. J.
+Cambridge Journal of Mathematics	1	math	
+Pure and Applied Mathematics Quarterly	1	math	
+International Mathematics Research Notices	1	math	IMRN
+Science China Mathematics	1	math	Sci. China Math.
+Mediterranean Journal of Mathematics	2	math	Mediterr. J. Math.
+Bulletin of the Brazilian Mathematical Society	2	math	
+Bulletin of the Malaysian Mathematical Sciences Society	2	math	
+Bulletin of the Korean Mathematical Society	3	math	
+Journal of the Korean Mathematical Society	3	math	
+Kyungpook Mathematical Journal	3	math	
+Taiwanese Journal of Mathematics	3	math	
+Bulletin of the Iranian Mathematical Society	3	math	
+Mathematica Slovaca	3	math	Math. Slovaca
+Czechoslovak Mathematical Journal	3	math	
+Publicationes Mathematicae Debrecen	3	math	Publ. Math. Debrecen
+Filomat	3	math	!Filomat
+Siberian Mathematical Journal	3	math	Sib. Math. J.
+Lobachevskii Journal of Mathematics	3	math	
+Journal of Mathematical Sciences	3	math	J. Math. Sci. (N.Y.)
+Sbornik: Mathematics	2	math	Sb. Math.
+Izvestiya: Mathematics	2	math	Izv. Math.
+Russian Mathematical Surveys	2	math	
+Proceedings of the Steklov Institute of Mathematics	3	math	
+Functional Analysis and Its Applications	3	math.anal	
+Experimental Mathematics	2	math	
+Mathematical Research Letters	1	math	
+Journal of Topology	1	math.geom	
+Journal of Topology and Analysis	2	math.geom	
+Algebraic & Geometric Topology	1	math.geom	
+Topology and its Applications	2	math.geom	
+Journal of Knot Theory and Its Ramifications	3	math.geom	
+Quantum Topology	1	math.geom	
+Geometriae Dedicata	2	math.geom	
+Journal of Geometric Analysis	1	math.geom	
+Journal of Geometry	3	math.geom	
+Journal of Geometry and Physics	2	math.phys	
+Forum Geometricorum	4	math.geom	
+Beiträge zur Algebra und Geometrie	3	math.geom	Beitr. Algebra Geom.
+Differential Geometry and its Applications	2	math.geom	
+Annals of Global Analysis and Geometry	2	math.geom	
+Communications in Analysis and Geometry	1	math.geom	
+Journal of Noncommutative Geometry	1	math.geom	
+Advances in Theoretical and Mathematical Physics	1	math.phys	
+Communications in Number Theory and Physics	1	math.nt	
+Elemente der Mathematik	3	math.edu	
+Discrete & Computational Geometry	1	math.comb	
+Computational Geometry	2	tcs	
+Journal of Computational Geometry	3	tcs	
+International Journal of Computational Geometry & Applications	3	tcs	
+Calculus of Variations and Partial Differential Equations	1	math.anal	Calc. Var. Partial Differ. Equ.
+Journal of Differential Equations	1	math.anal	
+Journal of Evolution Equations	1	math.anal	
+Archive for Rational Mechanics and Analysis	1	math.anal	ARMA
+Communications in Partial Differential Equations	1	math.anal	
+Annals of PDE	1	math.anal	
+Journal of Hyperbolic Differential Equations	2	math.anal	
+Nonlinear Analysis	1	math.anal	
+Nonlinear Differential Equations and Applications NoDEA	2	math.anal	NoDEA;Nonlinear Differ. Equ. Appl.
+Advances in Differential Equations	2	math.anal	
+Differential and Integral Equations	2	math.anal	
+Journal of Fourier Analysis and Applications	1	math.anal	
+Applied and Computational Harmonic Analysis	1	math.num	
+Constructive Approximation	1	math.anal	
+Journal of Approximation Theory	2	math.anal	
+Potential Analysis	2	math.anal	
+Journal of Mathematical Fluid Mechanics	1	math.anal	
+Journal of Functional Analysis	1	math.anal	
+Journal of Operator Theory	2	math.anal	
+Integral Equations and Operator Theory	2	math.anal	
+Operators and Matrices	3	math.anal	
+Banach Journal of Mathematical Analysis	2	math.anal	
+Complex Analysis and Operator Theory	2	math.anal	
+Annals of Functional Analysis	2	math.anal	
+Annales Academiae Scientiarum Fennicae Mathematica	2	math.anal	Ann. Acad. Sci. Fenn. Math.
+Journal of Convex Analysis	2	math.anal	
+Set-Valued and Variational Analysis	2	math.anal	
+Positivity	2	math.anal	!Positivity
+Analysis Mathematica	3	math.anal	
+Analysis and Applications	2	math.anal	
+Mathematical Models and Methods in Applied Sciences	1	math.num	M3AS
+Communications in Contemporary Mathematics	1	math.anal	
+Communications on Pure and Applied Analysis	2	math.anal	
+Communications in Mathematical Sciences	2	math.num	
+Methods and Applications of Analysis	3	math.anal	
+Studies in Applied Mathematics	1	math.num	
+Applied Mathematics Letters	1	math.num	
+Applied Mathematical Modelling	1	math.num	
+Applied Mathematics and Optimization	1	math.num	
+Zeitschrift für angewandte Mathematik und Physik	2	math.num	ZAMP
+Zeitschrift für Angewandte Mathematik und Mechanik	2	math.num	ZAMM
+European Journal of Applied Mathematics	2	math.num	
+IMA Journal of Applied Mathematics	2	math.num	
+Quarterly of Applied Mathematics	3	math.num	
+Mathematical Biosciences	2	math.num	
+Journal of Mathematical Biology	1	math.num	
+Bulletin of Mathematical Biology	2	math.num	
+Proceedings of the Royal Society A	1	phys	Proc. R. Soc. A;Proc. Roy. Soc. A
+Journal of Algebra	1	math.alg	
+Journal of Algebra and Its Applications	2	math.alg	
+Journal of Pure and Applied Algebra	1	math.alg	
+Journal of Algebraic Combinatorics	1	math.comb	
+Journal of Algebraic Geometry	1	math.geom	
+Algebraic Geometry	1	math.geom	
+Algebra & Number Theory	1	math.nt	
+Algebras and Representation Theory	2	math.alg	Algebr. Represent. Theory
+Representation Theory	1	math.alg	
+Communications in Algebra	2	math.alg	
+Algebra Colloquium	3	math.alg	
+Algebra Universalis	2	math.alg	
+Forum Mathematicum	2	math	
+Semigroup Forum	2	math.alg	
+International Journal of Algebra and Computation	2	math.alg	
+Journal of Group Theory	2	math.alg	
+Groups, Geometry, and Dynamics	1	math.alg	
+Journal of Commutative Algebra	2	math.alg	
+Journal of Lie Theory	3	math.alg	
+Transformation Groups	2	math.alg	
+Linear Algebra and its Applications	1	math.alg	
+Linear and Multilinear Algebra	2	math.alg	
+Electronic Journal of Linear Algebra	2	math.alg	
+Journal of Symbolic Computation	1	math.alg	
+Applicable Algebra in Engineering, Communication and Computing	3	math.alg	Appl. Algebra Engrg. Comm. Comput.
+Journal of Number Theory	2	math.nt	
+International Journal of Number Theory	3	math.nt	
+Research in Number Theory	2	math.nt	
+Journal de Théorie des Nombres de Bordeaux	2	math.nt	
+Functiones et Approximatio Commentarii Mathematici	2	math.nt	Funct. Approx. Comment. Math.
+Journal of Integer Sequences	3	math.nt	
+Integers	3	math.comb	^Integers;Integers: Electronic Journal of Combinatorial Number Theory
+The Fibonacci Quarterly	3	math.nt	
+Mathematics of Computation	1	math.num	
+Finite Fields and Their Applications	2	math.nt	
+Advances in Applied Mathematics	1	math	
+Combinatorica	1	math.comb	!Combinatorica
+Journal of Combinatorial Theory, Series A	1	math.comb	J. Combin. Theory A;J. Comb. Theory A;JCTA
+Journal of Combinatorial Theory, Series B	1	math.comb	J. Combin. Theory B;J. Comb. Theory B;JCTB
+Journal of Combinatorial Theory	1	math.comb	
+Combinatorial Theory	2	math.comb	
+Random Structures & Algorithms	1	math.comb	
+Combinatorics, Probability and Computing	1	math.comb	
+Electronic Journal of Combinatorics	2	math.comb	EJC
+European Journal of Combinatorics	2	math.comb	
+Discrete Mathematics	2	math.comb	
+Discrete Applied Mathematics	2	math.comb	
+Discrete Mathematics & Theoretical Computer Science	3	math.comb	DMTCS
+Discrete Mathematics Letters	3	math.comb	
+SIAM Journal on Discrete Mathematics	1	math.comb	SIDMA
+Journal of Graph Theory	2	math.comb	
+Graphs and Combinatorics	3	math.comb	
+Annals of Combinatorics	2	math.comb	
+Journal of Combinatorial Designs	2	math.comb	
+Designs, Codes and Cryptography	2	math.comb	Des. Codes Cryptogr.
+Journal of Combinatorial Optimization	2	math.comb	
+Journal of Combinatorial Mathematics and Combinatorial Computing	4	math.comb	
+Order	3	math.comb	
+Australasian Journal of Combinatorics	3	math.comb	
+Ars Combinatoria	4	math.comb	
+Utilitas Mathematica	4	math.comb	
+Ars Mathematica Contemporanea	2	math.comb	
+Contributions to Discrete Mathematics	4	math.comb	
+Journal of Combinatorics	2	math.comb	
+Advances in Combinatorics	2	math.comb	
+Discrete Analysis	1	math.comb	
+Algebraic Combinatorics	1	math.comb	
+Enumerative Combinatorics and Applications	3	math.comb	
+Séminaire Lotharingien de Combinatoire	3	math.comb	
+Discrete Optimization	2	math.num	
+The American Mathematical Monthly	2	math.edu	Amer. Math. Monthly;Am. Math. Mon.
+Mathematics Magazine	3	math.edu	
+The College Mathematics Journal	3	math.edu	
+The Mathematical Gazette	3	math.edu	
+The Mathematical Intelligencer	2	math.edu	
+ZDM Mathematics Education	1	math.edu	ZDM
+Educational Studies in Mathematics	1	math.edu	
+Journal for Research in Mathematics Education	1	math.edu	JRME
+International Journal of Mathematical Education in Science and Technology	2	math.edu	Internat. J. Math. Ed. Sci. Tech.
+PRIMUS	3	math.edu	
+Journal of Mathematical Behavior	2	math.edu	
+Mathematical Thinking and Learning	2	math.edu	
+Teaching Mathematics and its Applications	3	math.edu	
+Journal of Humanistic Mathematics	3	math.edu	
+Crux Mathematicorum	4	math.edu	
+Math Horizons	4	math.edu	
+L'Enseignement Mathématique	2	math.edu	
+Recreational Mathematics Magazine	4	math.edu	
+Journal of Recreational Mathematics	4	math.edu	
+Annals of Probability	1	math.prob	
+Annals of Applied Probability	1	math.prob	
+Probability Theory and Related Fields	1	math.prob	
+Electronic Journal of Probability	1	math.prob	
+Electronic Communications in Probability	2	math.prob	
+Stochastic Processes and their Applications	1	math.prob	
+Journal of Theoretical Probability	2	math.prob	
+Bernoulli	1	math.prob	!Bernoulli
+Journal of Applied Probability	2	math.prob	
+Advances in Applied Probability	2	math.prob	
+Probability Surveys	1	math.prob	
+Queueing Systems	2	math.prob	
+Random Matrices: Theory and Applications	2	math.prob	
+Brazilian Journal of Probability and Statistics	3	stat	Braz. J. Probab. Stat.
+Annals of Statistics	1	stat	
+Annals of Applied Statistics	1	stat	
+Annals of Mathematical Statistics	1	stat	
+Electronic Journal of Statistics	1	stat	
+Journal of the American Statistical Association	1	stat	JASA
+Journal of the Royal Statistical Society Series B	1	stat	J. R. Stat. Soc. Ser. B;J. R. Stat. Soc. B;JRSSB
+Journal of the Royal Statistical Society Series A	1	stat	J. R. Stat. Soc. Ser. A;J. R. Stat. Soc. A
+Journal of the Royal Statistical Society Series C	1	stat	J. R. Stat. Soc. Ser. C;J. R. Stat. Soc. C
+Biometrika	1	stat	!Biometrika
+Biometrics	1	stat	!Biometrics
+Statistical Science	1	stat	
+Statistica Sinica	1	stat	
+Scandinavian Journal of Statistics	2	stat	
+Journal of Multivariate Analysis	2	stat	
+Journal of Statistical Software	1	stat	
+Journal of Computational and Graphical Statistics	1	stat	
+Technometrics	1	stat	!Technometrics
+Statistics and Computing	1	stat	
+Bayesian Analysis	1	stat	
+Journal of Econometrics	1	stat	
+Econometrica	1	stat	!Econometrica
+Annals of the Institute of Statistical Mathematics	2	stat	
+Statistics & Probability Letters	2	stat	
+Information and Inference	1	stat	
+Computational Statistics & Data Analysis	1	stat	
+The American Statistician	2	stat	
+Journal of Symbolic Logic	1	math.logic	
+Bulletin of Symbolic Logic	1	math.logic	
+Annals of Pure and Applied Logic	1	math.logic	
+Archive for Mathematical Logic	2	math.logic	
+Notre Dame Journal of Formal Logic	2	math.logic	
+Journal of Mathematical Logic	1	math.logic	
+Mathematical Logic Quarterly	2	math.logic	MLQ
+Studia Logica	1	math.logic	
+Journal of Logic and Computation	2	math.logic	
+Logical Methods in Computer Science	2	math.logic	LMCS
+Journal of Automated Reasoning	2	math.logic	
+Journal of Philosophical Logic	1	math.logic	
+Review of Symbolic Logic	1	math.logic	
+Theory and Applications of Categories	2	math.logic	
+Reports on Mathematical Logic	3	math.logic	
+Mathematical Structures in Computer Science	2	math.logic	
+ACM Transactions on Computational Logic	2	math.logic	TOCL
+Formal Aspects of Computing	2	math.logic	
+Journal of Logical and Algebraic Methods in Programming	2	math.logic	
+Theory and Practice of Logic Programming	2	math.logic	TPLP
+Logic Journal of the IGPL	2	math.logic	
+Annals of Mathematics and Artificial Intelligence	2	math.logic	
+Formalized Mathematics	3	math.logic	
+Journal of Formalized Reasoning	2	math.logic	
+Journal of the ACM	1	tcs	JACM
+SIAM Journal on Computing	1	tcs	SICOMP
+ACM Transactions on Computation Theory	2	tcs	TOCT
+ACM Transactions on Algorithms	1	tcs	TALG
+Algorithmica	2	tcs	!Algorithmica
+Theoretical Computer Science	2	tcs	
+Information and Computation	2	tcs	
+Information Processing Letters	3	tcs	
+Journal of Computer and System Sciences	2	tcs	JCSS
+Computational Complexity	2	tcs	
+Theory of Computing	2	tcs	
+Theory of Computing Systems	2	tcs	
+Journal of Algorithms	2	tcs	
+Acta Informatica	3	tcs	
+Fundamenta Informaticae	3	tcs	
+Distributed Computing	2	tcs	
+Journal of Cryptology	1	tcs	
+Journal of Graph Algorithms and Applications	3	tcs	
+Journal of Mathematical Cryptology	3	tcs	
+Advances in Mathematics of Communications	2	tcs	
+Cryptography and Communications	2	tcs	
+IEEE Transactions on Information Theory	1	cs	
+Quantum	1	phys	^Quantum
+Quantum Information & Computation	3	tcs	
+Quantum Information Processing	2	tcs	
+npj Quantum Information	1	phys	
+Information Sciences	1	ai	
+ACM Computing Surveys	1	cs	
+Communications of the ACM	1	cs	
+Proceedings of the IEEE	1	cs	
+IEEE Transactions on Signal Processing	1	cs	
+Mathematical Programming	1	math.num	
+Mathematics of Operations Research	1	math.num	
+Operations Research	1	math.num	
+Operations Research Letters	2	math.num	
+Foundations of Computational Mathematics	1	math.num	
+Journal of Complexity	1	math.num	
+SIAM Journal on Numerical Analysis	1	math.num	
+SIAM Journal on Scientific Computing	1	math.num	
+SIAM Journal on Mathematical Analysis	1	math.anal	
+SIAM Journal on Applied Mathematics	1	math.num	
+SIAM Journal on Matrix Analysis and Applications	1	math.num	
+SIAM Journal on Control and Optimization	1	math.num	
+SIAM Journal on Optimization	1	math.num	
+SIAM Review	1	math.num	
+SIAM Journal on Imaging Sciences	1	math.num	
+SIAM Journal on Applied Dynamical Systems	1	math.dyn	
+SIAM Journal on Applied Algebra and Geometry	2	math.alg	
+SIAM Journal on Financial Mathematics	2	math.num	
+SIAM/ASA Journal on Uncertainty Quantification	1	math.num	JUQ
+SIAM Journal on Mathematics of Data Science	1	math.num	
+Multiscale Modeling & Simulation	1	math.num	
+Numerische Mathematik	1	math.num	
+IMA Journal of Numerical Analysis	1	math.num	
+Applied Numerical Mathematics	1	math.num	
+Journal of Computational and Applied Mathematics	1	math.num	
+Computers & Mathematics with Applications	2	math.num	
+Journal of Scientific Computing	1	math.num	
+BIT Numerical Mathematics	1	math.num	BIT
+Inverse Problems	1	math.num	
+Inverse Problems and Imaging	2	math.num	
+Numerical Algorithms	2	math.num	
+Mathematics and Computers in Simulation	2	math.num	
+Applied Mathematics and Computation	1	math.num	
+Journal of Optimization Theory and Applications	2	math.num	
+Journal of Mathematical Imaging and Vision	2	ai	
+Nonlinearity	1	math.dyn	!Nonlinearity
+Ergodic Theory and Dynamical Systems	1	math.dyn	
+Discrete and Continuous Dynamical Systems	1	math.dyn	
+Discrete and Continuous Dynamical Systems - Series B	2	math.dyn	
+Journal of Dynamics and Differential Equations	1	math.dyn	
+Journal of Modern Dynamics	2	math.dyn	
+Dynamical Systems	2	math.dyn	
+Regular and Chaotic Dynamics	2	math.dyn	
+Chaos, Solitons & Fractals	1	phys	
+Physica D	1	phys	Physica D: Nonlinear Phenomena
+Physica A	2	phys	Physica A: Statistical Mechanics and its Applications
+Chaos	1	phys	
+Journal of Machine Learning Research	1	ai	JMLR
+Transactions on Machine Learning Research	1	ai	TMLR
+Machine Learning	1	ai	^Machine Learning
+Journal of Artificial Intelligence Research	1	ai	JAIR
+Artificial Intelligence	1	ai	^Artificial Intelligence;^Artif. Intell.
+IEEE Transactions on Pattern Analysis and Machine Intelligence	1	ai	TPAMI
+International Journal of Computer Vision	1	ai	IJCV
+IEEE Transactions on Neural Networks and Learning Systems	1	ai	TNNLS
+IEEE Transactions on Image Processing	1	ai	
+Neural Networks	1	ai	^Neural Networks;^Neural Netw.
+Neural Computation	1	ai	
+Pattern Recognition	1	ai	^Pattern Recognition;^Pattern Recognit.
+Knowledge-Based Systems	1	ai	
+Neurocomputing	1	ai	!Neurocomputing
+Expert Systems with Applications	1	ai	
+Data Mining and Knowledge Discovery	1	ai	
+IEEE Transactions on Knowledge and Data Engineering	1	ai	TKDE
+Autonomous Agents and Multi-Agent Systems	1	ai	
+Computational Linguistics	1	ai	
+Transactions of the Association for Computational Linguistics	1	ai	TACL
+Physical Review Letters	1	phys	PRL
+Physical Review X	1	phys	PRX
+Physical Review A	1	phys	
+Physical Review B	1	phys	
+Physical Review C	1	phys	
+Physical Review D	1	phys	
+Physical Review E	1	phys	
+Physical Review Research	1	phys	
+Physical Review Applied	1	phys	
+Physical Review Fluids	1	phys	
+Physical Review Accelerators and Beams	2	phys	
+PRX Quantum	1	phys	
+Reviews of Modern Physics	1	phys	
+Physics Reports	1	phys	
+Physics Letters B	1	phys	
+Physics Letters A	2	phys	
+Nuclear Physics B	1	phys	
+Nuclear Physics A	2	phys	
+Journal of High Energy Physics	1	phys	JHEP
+European Physical Journal C	1	phys	
+Classical and Quantum Gravity	1	phys	
+General Relativity and Gravitation	2	phys	
+Annals of Physics	1	phys	
+Journal of Cosmology and Astroparticle Physics	1	phys	JCAP
+The Astrophysical Journal	1	phys	!ApJ
+Monthly Notices of the Royal Astronomical Society	1	phys	Mon. Not. R. Astron. Soc.;MNRAS
+Astronomy & Astrophysics	1	phys	Astron. Astrophys.;^A&A
+Nature	1	phys	Nature (London)
+Nature Physics	1	phys	Nat. Phys.
+Nature Communications	1	phys	Nat. Commun.
+Nature Machine Intelligence	1	ai	Nat. Mach. Intell.
+Proceedings of the National Academy of Sciences	1	phys	PNAS;Proc. Natl. Acad. Sci. U.S.A.
+Scientific Reports	1	phys	Sci. Rep.
+Quantum Science and Technology	1	phys	
+Reports on Progress in Physics	1	phys	
+Europhysics Letters	2	phys	EPL
+Communications Physics	1	phys	
+SciPost Physics	1	phys	
+New Journal of Physics	1	phys	
+Journal of Physics A: Mathematical and Theoretical	2	phys	J. Phys. A
+Journal of Mathematical Physics	2	math.phys	
+Letters in Mathematical Physics	1	math.phys	
+Reviews in Mathematical Physics	2	math.phys	
+Communications in Mathematical Physics	1	math.phys	CMP
+Mathematical Physics, Analysis and Geometry	2	math.phys	
+Symmetry, Integrability and Geometry: Methods and Applications	2	math.phys	SIGMA
+Journal of Statistical Physics	2	phys	
+Journal of Statistical Mechanics: Theory and Experiment	2	phys	
+Journal of Fluid Mechanics	1	phys	
+Journal of Computational Physics	1	phys	
+NeurIPS	1	conf	Advances in Neural Information Processing Systems;Neural Information Processing Systems;NIPS;!NeurIPS
+ICML	1	conf	International Conference on Machine Learning
+ICLR	1	conf	International Conference on Learning Representations
+AAAI	1	conf	AAAI Conference on Artificial Intelligence
+IJCAI	1	conf	International Joint Conference on Artificial Intelligence
+ACL	1	conf	Annual Meeting of the Association for Computational Linguistics
+EMNLP	1	conf	Empirical Methods in Natural Language Processing
+NAACL	1	conf	North American Chapter of the Association for Computational Linguistics
+EACL	1	conf	European Chapter of the Association for Computational Linguistics
+COLING	1	conf	International Conference on Computational Linguistics
+COLM	1	conf	Conference on Language Modeling
+CVPR	1	conf	Computer Vision and Pattern Recognition
+ICCV	1	conf	International Conference on Computer Vision
+ECCV	1	conf	European Conference on Computer Vision
+STOC	1	conf	ACM Symposium on Theory of Computing;Symposium on Theory of Computing
+FOCS	1	conf	Symposium on Foundations of Computer Science;Foundations of Computer Science
+SODA	1	conf	Symposium on Discrete Algorithms
+ICALP	1	conf	International Colloquium on Automata, Languages, and Programming
+LICS	1	conf	Symposium on Logic in Computer Science;Logic in Computer Science
+CAV	1	conf	Computer Aided Verification
+ITP	1	conf	Interactive Theorem Proving
+CADE	1	conf	Conference on Automated Deduction
+IJCAR	1	conf	International Joint Conference on Automated Reasoning
+TACAS	1	conf	Tools and Algorithms for the Construction and Analysis of Systems
+POPL	1	conf	Principles of Programming Languages
+PLDI	1	conf	Programming Language Design and Implementation
+ICFP	1	conf	International Conference on Functional Programming
+CSL	1	conf	Computer Science Logic
+KDD	1	conf	Knowledge Discovery and Data Mining;SIGKDD
+WWW	1	conf	The Web Conference;International World Wide Web Conference
+SIGIR	1	conf	Research and Development in Information Retrieval
+COLT	1	conf	Conference on Learning Theory;Annual Workshop on Computational Learning Theory
+ALT	2	conf	Algorithmic Learning Theory
+UAI	1	conf	Uncertainty in Artificial Intelligence
+AISTATS	1	conf	Artificial Intelligence and Statistics;!AISTATS
+ICDM	1	conf	International Conference on Data Mining
+SDM	1	conf	SIAM International Conference on Data Mining
+ECML-PKDD	1	conf	ECML PKDD;European Conference on Machine Learning;PKDD
+WSDM	1	conf	Web Search and Data Mining
+CIKM	1	conf	Conference on Information and Knowledge Management
+ACML	2	conf	Asian Conference on Machine Learning
+ICASSP	2	conf	International Conference on Acoustics, Speech and Signal Processing
+ISIT	1	conf	International Symposium on Information Theory
+CRYPTO	1	conf	International Cryptology Conference
+EUROCRYPT	1	conf	Theory and Applications of Cryptographic Techniques
+ASIACRYPT	1	conf	International Conference on the Theory and Application of Cryptology and Information Security
+TCC	1	conf	Theory of Cryptography Conference
+PODC	1	conf	Principles of Distributed Computing
+DISC	1	conf	International Symposium on Distributed Computing
+SPAA	1	conf	Parallelism in Algorithms and Architectures
+ITCS	1	conf	Innovations in Theoretical Computer Science
+CCC	1	conf	Computational Complexity Conference
+STACS	1	conf	Symposium on Theoretical Aspects of Computer Science
+ESA	1	conf	European Symposium on Algorithms
+SoCG	1	conf	Symposium on Computational Geometry;!SoCG
+IPCO	1	conf	Integer Programming and Combinatorial Optimization
+APPROX	2	conf	Approximation Algorithms for Combinatorial Optimization Problems
+RANDOM	2	conf	Randomization and Computation
+FSTTCS	2	conf	Foundations of Software Technology and Theoretical Computer Science
+MFCS	2	conf	Mathematical Foundations of Computer Science
+ISAAC	2	conf	International Symposium on Algorithms and Computation
+SAT	1	conf	Theory and Applications of Satisfiability Testing
+CP	1	conf	Principles and Practice of Constraint Programming
+KR	1	conf	Principles of Knowledge Representation and Reasoning
+ICAPS	1	conf	Automated Planning and Scheduling
+AAMAS	1	conf	Autonomous Agents and Multiagent Systems
+ECAI	1	conf	European Conference on Artificial Intelligence
+CoRL	1	conf	Conference on Robot Learning;!CoRL
+ICRA	1	conf	International Conference on Robotics and Automation
+IROS	1	conf	Intelligent Robots and Systems
+SIGGRAPH	1	conf	
+CHI	1	conf	Human Factors in Computing Systems
+ICSE	1	conf	International Conference on Software Engineering
+OSDI	1	conf	Operating Systems Design and Implementation
+SOSP	1	conf	Symposium on Operating Systems Principles
+SIGCOMM	1	conf	
+NSDI	1	conf	Networked Systems Design and Implementation
+VLDB	1	conf	Very Large Data Bases;Proc. VLDB Endow.
+SIGMOD	1	conf	Management of Data
+ISCA	1	conf	International Symposium on Computer Architecture
+MICRO	1	conf	International Symposium on Microarchitecture
+USENIX Security	1	conf	USENIX Security Symposium
+NDSS	1	conf	Network and Distributed System Security Symposium
+CCS	1	conf	Computer and Communications Security
+SOSA	2	conf	Symposium on Simplicity in Algorithms
+ISSAC	1	conf	International Symposium on Symbolic and Algebraic Computation
+LPAR	2	conf	Logic for Programming, Artificial Intelligence and Reasoning
+FPSAC	2	conf	Formal Power Series and Algebraic Combinatorics
+ESOP	1	conf	European Symposium on Programming
+CONCUR	1	conf	International Conference on Concurrency Theory
+EC	1	conf	ACM Conference on Economics and Computation
+WINE	2	conf	Web and Internet Economics
+LATIN	2	conf	Latin American Theoretical Informatics Symposium
+WADS	2	conf	Algorithms and Data Structures Symposium
+SWAT	2	conf	Scandinavian Symposium and Workshops on Algorithm Theory
+CPM	2	conf	Combinatorial Pattern Matching
+COCOON	2	conf	Computing and Combinatorics Conference
+ALENEX	2	conf	Algorithm Engineering and Experiments
+Advances in Mathematical Physics	2	math.phys	
+Mathematical and Computer Modelling	2	math.num	
+Theory of Probability and Its Applications	2	math.prob	
+Discrete Mathematics, Algorithms and Applications	3	math.comb	
