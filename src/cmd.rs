@@ -446,18 +446,19 @@ pub async fn text(net: &Net, a: &Args, input: Input) -> Res {
     let sec = a.get("sec").map(str::to_string);
     let tok = a.num::<usize>("tok").unwrap_or(DEFAULT_TEXT_TOK);
     let skip = a.num::<usize>("skip").unwrap_or(0);
+    let raw = a.flag("raw");
     let (s, failed) = per_doc(net, a, ids, |id, d| {
         let region: &str = match &sec {
             Some(k) => match html::find_section(&d.sections, k) {
                 Some(s) => d.text.get(s.start..s.end).unwrap_or(""),
                 None => return format!("{id}: error: no section {k:?} (see `arx outline {id}`)"),
             },
-            // raw TeX: skip the preamble, the typeset body starts at \begin{document}
-            None if d.is_tex => tex::body(&d.text),
+            // TeX: skip the preamble, the typeset body starts at \begin{document} (--raw: whole source)
+            None if d.is_tex && !raw => tex::body(&d.text),
             None => &d.text,
         };
         let cleaned;
-        let body: &str = if d.is_tex {
+        let body: &str = if d.is_tex && !raw {
             cleaned = tex::clean(region);
             &cleaned
         } else {

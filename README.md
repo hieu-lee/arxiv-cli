@@ -51,6 +51,22 @@ Client-side (over-fetching, concurrent enrichment): fuzzy author (accents, initi
 
 Rules: comma inside a flag = OR, repeating a flag = AND. Dates: `2024`, `2024-03`, `2024-03-05`, `30d`, `6m`, `2y`.
 
+## Versus arxiv-mcp-server
+
+Every tool of [blazickjp/arxiv-mcp-server](https://github.com/blazickjp/arxiv-mcp-server) has a counterpart here except the local embedding index (`semantic_search` / `reindex`) and the on-disk paper library listing:
+
+| arxiv-mcp-server tool | arx |
+|---|---|
+| `search_papers`, `get_abstract` | `search`, `get` (plus fuzzy author, institution, quartile, preprint/published, facets) |
+| `download_paper`, `read_paper` | `text`, `dl` |
+| `get_paper_outline`, `read_paper_section`, `search_paper_text` | `outline`, `sec`, `grep` |
+| `get_paper_latex`, `list_paper_latex_sections`, `get_paper_latex_section` | `--src tex` on `text` / `outline` / `sec` / `grep` / `prob` / `refs` (cleaned text; `--raw` on `text`/`sec` returns the flattened LaTeX source with includes inlined and comments dropped; `dl --src tex` downloads the untouched source archive) |
+| `citation_graph` | `refs` (arXiv bibliography), `cites` (Semantic Scholar citations/references) |
+| `export_citations` | `bib` |
+| `watch_topic`, `list_watches`, `check_alerts`, `unwatch_topic` | `watch`, `watches`, `alerts`, `unwatch` |
+
+Where it differs: one invocation can run many actions (`x 'a ; b | c'`) with concurrent full-text fetches and request batching, and the whole interface costs ~0.5k tokens of help instead of 19 tool definitions (about 24 KB of definition source in that server, versus 1.9 KB of `arx -h`).
+
 ## Notes and known limits
 
 * Venue quartiles come from `data/journals.tsv` (approximate; unknown venues are left unclassified rather than guessed).

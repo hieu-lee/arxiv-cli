@@ -66,7 +66,8 @@ pub const FLAGS: &[Flag] = &[
     f("ctx", None, "N", "content", "context chars around grep hit (default 120)"),
     f("max", Some('m'), "N", "content", "max items/hits per paper"),
     f("src", None, "S", "content", "html (default) | tex | pdf (dl only)"),
-    f("to", None, "PATH", "content", "write fetched file(s) to dir instead of printing"),
+    f("raw", None, "", "content", "text/sec with --src tex: flattened LaTeX source (includes inlined, comments dropped) instead of cleaned text"),
+    f("to", None, "PATH", "content", "write fetched file(s) to dir (dl)"),
     // ---- engine ----
     f("par", Some('j'), "N", "engine", "max concurrent www fetches (default 12)"),
     f("rate", None, "MS", "engine", "min gap between API calls in ms (default 3000, arXiv policy)"),
@@ -335,6 +336,14 @@ mod tests {
         assert_eq!(a.groups("au").len(), 2);
         assert!(a.flag("published"));
     }
+    #[test]
+    fn raw_is_a_switch() {
+        let a = parse(&["ID".to_string(), "--raw".into(), "--src".into(), "tex".into()]).unwrap();
+        assert!(a.flag("raw"));
+        assert_eq!(a.get("src"), Some("tex"));
+        assert_eq!(a.pos, ["ID"]);
+    }
+
     #[test]
     fn unknown_flag_suggests() {
         let e = parse(&v(&["--sinc", "2020"])).unwrap_err();
