@@ -10,6 +10,23 @@ use crate::model::*;
 use std::borrow::Cow;
 use std::cell::Cell;
 
+/// What the caller reads from the result. Everything else is not built (cheaper), and outside
+/// `All` / `Text` the `md` and the section byte ranges only cover the parts that were needed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Want {
+    /// every field (tests; the commands name what they read)
+    #[allow(dead_code)]
+    All,
+    /// `title`, `md`, `sections` (text, sec, grep)
+    Text,
+    /// `title`, `sections` ids / levels / titles (outline)
+    Outline,
+    /// `title`, `items` (prob)
+    Items,
+    /// `title`, `refs`
+    Refs,
+}
+
 pub struct Doc {
     pub title: String,
     /// Whole paper as Markdown ($latex$ math from alttext).
@@ -19,6 +36,11 @@ pub struct Doc {
     pub refs: Vec<Ref>,
 }
 
+#[cfg(test)]
+pub fn parse(html: &str) -> Doc {
+    parse_for(html, Want::All)
+}
+
 /// Parse an arxiv.org/html (LaTeXML) or ar5iv page. Never panics on junk.
 ///
 /// Markdown conventions: `# title`, sections `## 2 Heading` (section level 1), `### 2.1 ..`,
@@ -26,9 +48,13 @@ pub struct Doc {
 /// `**Problem 1.** text`, inline math `$..$`, display math `$$..$$`, captions `[fig: ..]`
 /// (`[table: ..]`, `[listing: ..]`), footnotes `[fn: ..]`.
 /// `Section.level` is 1 for \section, 2 for \subsection, 3 for \subsubsection.
-pub fn parse(html: &str) -> Doc {
-    let mut p = Parser::new(html);
-    let start = html.find("<article").unwrap_or(0);
+///
+/// Only what `want` names is built.
+pub fn parse_for(html: &str, want: Want) -> Doc {
+    let start = find_article(html.as_bytes()).unwrap_or(0);
+    // the Markdown of a paper is typically 0.3-0.4 of its article markup
+    let md_cap = if matches!(want, Want::All | Want::Text) { (html.len() - start) / 5 * 2 } else { 1024 };
+    let mut p = Parser::new(html, want, md_cap);
     p.i = start;
     p.run();
     let fallback_title = if start > 0 { head_title(&html[..start]) } else { head_title(html) };
@@ -40,9 +66,9 @@ pub fn parse(html: &str) -> Doc {
 /// CSS/JS before it) and only that block is tokenised.
 pub fn insts_only(html: &str) -> Vec<String> {
     let head = floor_boundary(html, html.len().min(256 * 1024));
-    let Some(k) = html[..head].find("ltx_authors") else { return Vec::new() };
+    let Some(k) = find_pat(&html.as_bytes()[..head], 0, b"ltx_authors", &AUTHORS) else { return Vec::new() };
     let Some(lt) = html[..k].rfind('<') else { return Vec::new() };
-    let mut p = Parser::new(html);
+    let mut p = Parser::new(html, Want::Outline, 0);
     p.i = lt;
     p.stop_after_authors = true;
     p.run();
@@ -176,6 +202,12 @@ fn decode_entities(s: &str) -> Cow<'_, str> {
         return Cow::Borrowed(s);
     }
     let mut out = String::with_capacity(s.len());
+    decode_into(s, &mut out);
+    Cow::Owned(out)
+}
+
+/// Append `s` with its entities decoded.
+fn decode_into(s: &str, out: &mut String) {
     let mut rest = s;
     while let Some(k) = rest.find('&') {
         out.push_str(&rest[..k]);
@@ -206,18 +238,138 @@ fn decode_entities(s: &str) -> Cow<'_, str> {
         }
     }
     out.push_str(rest);
-    Cow::Owned(out)
+}
+
+/// 0 = ASCII non-whitespace, 1 = ASCII whitespace (as `char::is_whitespace`), 2 = non-ASCII.
+static WS_CLASS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        t[i] = if i >= 0x80 {
+            2
+        } else if i == b' ' as usize || (i >= 9 && i <= 13) {
+            1
+        } else {
+            0
+        };
+        i += 1;
+    }
+    t
+};
+
+/// First index >= `from` of byte `x` in `b`, 8 bytes per step.
+fn find_byte(b: &[u8], from: usize, x: u8) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let pat = LO.wrapping_mul(u64::from(x));
+    let mut i = from;
+    while let Some(Ok(w)) = b.get(i..i + 8).map(<[u8; 8]>::try_from) {
+        let v = u64::from_le_bytes(w) ^ pat;
+        let t = v.wrapping_sub(LO) & !v & HI;
+        if t != 0 {
+            return Some(i + (t.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    b.get(i..)?.iter().position(|&c| c == x).map(|p| i + p)
+}
+
+/// Horspool shift table for `pat`.
+const fn skip_table(pat: &[u8]) -> [u8; 256] {
+    let m = pat.len();
+    let mut t = [m as u8; 256];
+    let mut k = 0;
+    while k + 1 < m {
+        t[pat[k] as usize] = (m - 1 - k) as u8;
+        k += 1;
+    }
+    t
+}
+
+static MATH_END_LO: [u8; 256] = skip_table(b"</math");
+static MATH_END_UP: [u8; 256] = skip_table(b"</MATH");
+static AUTHORS: [u8; 256] = skip_table(b"ltx_authors");
+
+
+/// First index >= `from` of `pat` in `b` (Horspool search with the precomputed `skip` table).
+fn find_pat(b: &[u8], from: usize, pat: &[u8], skip: &[u8; 256]) -> Option<usize> {
+    let m = pat.len();
+    let last = pat[m - 1];
+    let mut i = from;
+    while i + m <= b.len() {
+        let c = b[i + m - 1];
+        if c == last && b[i..i + m - 1] == pat[..m - 1] {
+            return Some(i);
+        }
+        i += usize::from(skip[c as usize]);
+    }
+    None
+}
+
+/// Offset of the first `<article` (the head of a page is mostly CSS / scripts with few `<`).
+fn find_article(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(k) = find_byte(b, i, b'<') {
+        if b[k..].starts_with(b"<article") {
+            return Some(k);
+        }
+        i = k + 1;
+    }
+    None
+}
+
+/// Index after the whitespace run starting at byte `i` (a char boundary).
+fn skip_ws(t: &str, mut i: usize) -> usize {
+    let b = t.as_bytes();
+    while i < b.len() {
+        match WS_CLASS[b[i] as usize] {
+            1 => i += 1,
+            0 => break,
+            _ => match t[i..].chars().next() {
+                Some(c) if c.is_whitespace() => i += c.len_utf8(),
+                _ => break,
+            },
+        }
+    }
+    i
+}
+
+/// Index after the run of non-whitespace chars starting at byte `i` (a char boundary).
+fn skip_word(t: &str, mut i: usize) -> usize {
+    let b = t.as_bytes();
+    while i < b.len() {
+        match WS_CLASS[b[i] as usize] {
+            0 => i += 1,
+            1 => break,
+            _ => match t[i..].chars().next() {
+                Some(c) if !c.is_whitespace() => i += c.len_utf8(),
+                _ => break,
+            },
+        }
+    }
+    i
 }
 
 fn collapse_ws(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for w in s.split_whitespace() {
-        if !out.is_empty() {
+    collapse_into(&mut out, s);
+    out
+}
+
+/// Append `s` with whitespace runs collapsed to one space and the ends trimmed.
+pub(crate) fn collapse_into(out: &mut String, s: &str) {
+    let n = s.len();
+    let mut i = skip_ws(s, 0);
+    let mut first = true;
+    while i < n {
+        let end = skip_word(s, i);
+        if !first {
             out.push(' ');
         }
-        out.push_str(w);
+        first = false;
+        out.push_str(&s[i..end]);
+        i = skip_ws(s, end);
     }
-    out
 }
 
 fn strip_tags(s: &str) -> String {
@@ -363,14 +515,20 @@ enum T {
 }
 
 fn tag_of(name: &[u8]) -> T {
-    let mut buf = [0u8; 14];
-    if name.len() > buf.len() {
-        return T::Other;
+    let t = tag_of_lower(name);
+    if t == T::Other && name.len() <= 14 && name.iter().any(u8::is_ascii_uppercase) {
+        let mut buf = [0u8; 14];
+        for (d, s) in buf.iter_mut().zip(name) {
+            *d = s.to_ascii_lowercase();
+        }
+        return tag_of_lower(&buf[..name.len()]);
     }
-    for (d, s) in buf.iter_mut().zip(name) {
-        *d = s.to_ascii_lowercase();
-    }
-    match &buf[..name.len()] {
+    t
+}
+
+/// `tag_of` for a lower-case name.
+fn tag_of_lower(name: &[u8]) -> T {
+    match name {
         b"div" => T::Div,
         b"span" => T::Span,
         b"p" => T::P,
@@ -403,6 +561,30 @@ fn tag_of(name: &[u8]) -> T {
     }
 }
 
+const B_WS: u8 = 1;
+const B_NAME: u8 = 2;
+const B_ATTR_END: u8 = 4;
+
+/// Byte classes for the tag scanner: ASCII whitespace, tag-name characters, attribute-name terminators.
+static BYTE_CLASS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let c = i as u8;
+        if c.is_ascii_whitespace() {
+            t[i] |= B_WS;
+        }
+        if c.is_ascii_alphanumeric() || c == b'-' || c == b':' || c == b'_' {
+            t[i] |= B_NAME;
+        }
+        if matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'>' | b'/') {
+            t[i] |= B_ATTR_END;
+        }
+        i += 1;
+    }
+    t
+};
+
 /// Open elements tracked at most; deeper tags are ignored. Closers only search the top MAX_SCAN frames.
 const MAX_DEPTH: usize = 4096;
 const MAX_SCAN: usize = 64;
@@ -434,7 +616,7 @@ const F_FIG_TABLE: u64 = 1 << 23;
 const F_FIG_LISTING: u64 = 1 << 24;
 const F_FIG_ALGO: u64 = 1 << 25;
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 struct Cls<'a> {
     flags: u64,
     /// suffix of `ltx_theorem_<kind>`
@@ -453,6 +635,29 @@ fn classify(class: &str) -> Cls<'_> {
     let mut c = Cls::default();
     for tok in class.split_ascii_whitespace() {
         let Some(r) = tok.strip_prefix("ltx_") else { continue };
+        // first two bytes of every recognised class: the rest (ltx_text, ltx_para, ltx_font_*, ...) is skipped early
+        let rb = r.as_bytes();
+        if rb.len() < 2
+            || !matches!(
+                (rb[0], rb[1]),
+                (b't', b'h' | b'i' | b'a' | b'o')
+                    | (b'r', b'u' | b'o')
+                    | (b'b', b'i')
+                    | (b'a', b'u' | b'l')
+                    | (b'p', b'e' | b'a')
+                    | (b'n', b'o')
+                    | (b'e', b'q')
+                    | (b'l', b'i' | b's' | b'o')
+                    | (b'v', b'e')
+                    | (b'i', b'n')
+                    | (b'f', b'l')
+                    | (b'd', b'a')
+                    | (b'T', b'O')
+                    | (b'c', b'o')
+            )
+        {
+            continue;
+        }
         c.flags |= match r {
             "theorem" => F_THEOREM,
             "title" => F_TITLE,
@@ -565,13 +770,14 @@ struct BibState {
     hrefs: String,
 }
 
-struct ItemBuild {
+struct ItemBuild<'a> {
     start: usize,
     end: usize,
     body_start: usize,
     label: String,
-    class_kind: String,
-    sec: String,
+    class_kind: &'a str,
+    /// index into `secs` of the enclosing section
+    sec: Option<usize>,
 }
 
 struct Parser<'a> {
@@ -593,24 +799,39 @@ struct Parser<'a> {
     secs: Vec<Section>,
     sec_open: Vec<usize>,
     sec_seq: u32,
-    items: Vec<ItemBuild>,
+    items: Vec<ItemBuild<'a>>,
     thm_stack: Vec<usize>,
-    pending_kind: String,
+    /// Largest end offset of a closed theorem: later cleanup can cut markdown back below it, and text
+    /// written there is then read as part of the item.
+    item_hi: usize,
+    pending_kind: &'a str,
     refs: Vec<Ref>,
     bib: Option<BibState>,
     cell_depth: u32,
     li_depth: u32,
     list_depth: u32,
-    /// Heading levels: part/chapter exist only in some documents; `section` sits below whichever are present.
-    lvl_chapter: u8,
-    lvl_section: u8,
+    levels: Option<(u8, u8)>,
+    want_md: bool,
+    want_items: bool,
+    want_refs: bool,
+    /// open `<sup>` / `<sub>` frames (closing one inserts a byte, shifting every offset recorded inside)
+    supsub: u32,
+    /// reusable buffers for decoded text and cleaned TeX
+    dec: String,
+    tex: String,
+    /// buffers of the last finished bibliography entry, reused by the next one
+    spare_tag: String,
+    spare_hrefs: String,
     eq_depth: u32,
     keep_ws: u8,
     first_line: bool,
     row_stack: Vec<(usize, u32)>,
     fig_kind: Vec<&'static str>,
     insts: Vec<String>,
-    names: Vec<String>,
+    /// author names, one per line
+    names: String,
+    /// last `classify` result per class-attribute hash slot (pages repeat a few dozen class strings)
+    cls_cache: Vec<(&'a str, Cls<'a>)>,
     authors: u32,
     stop_after_authors: bool,
     done: bool,
@@ -621,12 +842,13 @@ fn decode_attr(v: &str) -> Cow<'_, str> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(s: &'a str) -> Self {
+    fn new(s: &'a str, want: Want, md_cap: usize) -> Self {
+        let want_md = matches!(want, Want::All | Want::Text);
         Parser {
             s,
             b: s.as_bytes(),
             i: 0,
-            md: String::with_capacity(s.len() / 6),
+            md: String::with_capacity(md_cap),
             sp: false,
             need_break: 0,
             runin: false,
@@ -643,21 +865,30 @@ impl<'a> Parser<'a> {
             sec_seq: 0,
             items: Vec::new(),
             thm_stack: Vec::new(),
-            pending_kind: String::new(),
+            item_hi: 0,
+            pending_kind: "",
             refs: Vec::new(),
             bib: None,
             cell_depth: 0,
             li_depth: 0,
             list_depth: 0,
-            lvl_chapter: 1 + u8::from(s.contains("ltx_title_part")),
-            lvl_section: 1 + u8::from(s.contains("ltx_title_part")) + u8::from(s.contains("ltx_title_chapter")),
+            levels: None,
+            want_md,
+            want_items: matches!(want, Want::All | Want::Items),
+            want_refs: matches!(want, Want::All | Want::Refs),
+            supsub: 0,
+            dec: String::new(),
+            tex: String::new(),
+            spare_tag: String::new(),
+            spare_hrefs: String::new(),
             eq_depth: 0,
             keep_ws: 0,
             first_line: false,
             row_stack: Vec::new(),
             fig_kind: Vec::new(),
             insts: Vec::new(),
-            names: Vec::new(),
+            names: String::new(),
+            cls_cache: Vec::new(),
             authors: 0,
             stop_after_authors: false,
             done: false,
@@ -669,16 +900,16 @@ impl<'a> Parser<'a> {
     fn run(&mut self) {
         let n = self.b.len();
         while self.i < n && !self.done {
-            let rest = &self.s[self.i..];
-            match rest.find('<') {
+            let s = self.s;
+            match find_byte(self.b, self.i, b'<') {
                 None => {
-                    self.text(rest);
+                    self.text(&s[self.i..]);
                     self.i = n;
                 }
-                Some(0) => self.tag(),
+                Some(k) if k == self.i => self.tag(),
                 Some(k) => {
-                    self.text(&rest[..k]);
-                    self.i += k;
+                    self.text(&s[self.i..k]);
+                    self.i = k;
                     self.tag();
                 }
             }
@@ -720,12 +951,12 @@ impl<'a> Parser<'a> {
             return;
         }
         let mut j = ns;
-        while j < n && (b[j].is_ascii_alphanumeric() || b[j] == b'-' || b[j] == b':' || b[j] == b'_') {
+        while j < n && BYTE_CLASS[b[j] as usize] & B_NAME != 0 {
             j += 1;
         }
         let t = tag_of(&b[ns..j]);
         if closing {
-            self.i = s[j..].find('>').map(|e| j + e + 1).unwrap_or(n);
+            self.i = if b.get(j) == Some(&b'>') { j + 1 } else { s[j..].find('>').map(|e| j + e + 1).unwrap_or(n) };
             self.close_tag(t);
             return;
         }
@@ -739,7 +970,7 @@ impl<'a> Parser<'a> {
             }
         }
         loop {
-            while j < n && b[j].is_ascii_whitespace() {
+            while j < n && BYTE_CLASS[b[j] as usize] & B_WS != 0 {
                 j += 1;
             }
             if j >= n {
@@ -759,7 +990,7 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             let an = j;
-            while j < n && !matches!(b[j], b' ' | b'\t' | b'\n' | b'\r' | b'=' | b'>' | b'/') {
+            while j < n && BYTE_CLASS[b[j] as usize] & B_ATTR_END == 0 {
                 j += 1;
             }
             if j == an {
@@ -767,21 +998,20 @@ impl<'a> Parser<'a> {
                 continue;
             }
             let aname = &b[an..j];
-            while j < n && b[j].is_ascii_whitespace() {
+            while j < n && BYTE_CLASS[b[j] as usize] & B_WS != 0 {
                 j += 1;
             }
             let mut val = "";
             if j < n && b[j] == b'=' {
                 j += 1;
-                while j < n && b[j].is_ascii_whitespace() {
+                while j < n && BYTE_CLASS[b[j] as usize] & B_WS != 0 {
                     j += 1;
                 }
                 if j < n && (b[j] == b'"' || b[j] == b'\'') {
-                    let q = b[j] as char;
-                    match s[j + 1..].find(q) {
+                    match find_byte(b, j + 1, b[j]) {
                         Some(e) => {
-                            val = &s[j + 1..j + 1 + e];
-                            j = j + 1 + e + 1;
+                            val = &s[j + 1..e];
+                            j = e + 1;
                         }
                         None => {
                             self.i = n;
@@ -790,7 +1020,7 @@ impl<'a> Parser<'a> {
                     }
                 } else {
                     let vs = j;
-                    while j < n && !b[j].is_ascii_whitespace() && b[j] != b'>' {
+                    while j < n && BYTE_CLASS[b[j] as usize] & B_WS == 0 && b[j] != b'>' {
                         j += 1;
                     }
                     val = &s[vs..j];
@@ -821,7 +1051,7 @@ impl<'a> Parser<'a> {
 
     // ------------------------------------------------------------------ tree events
 
-    fn open_tag(&mut self, t: T, a: &Attrs) {
+    fn open_tag(&mut self, t: T, a: &Attrs<'a>) {
         match t {
             T::Br => {
                 if self.cap_depth > 0 {
@@ -849,7 +1079,7 @@ impl<'a> Parser<'a> {
             }
             T::A => {
                 if let Some(bib) = self.bib.as_mut() {
-                    if !a.href.is_empty() && self.skip == 0 {
+                    if self.want_refs && !a.href.is_empty() && self.skip == 0 {
                         bib.hrefs.push(' ');
                         bib.hrefs.push_str(&decode_attr(a.href));
                     }
@@ -918,9 +1148,26 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn decide(&mut self, t: T, a: &Attrs) -> Act {
+    fn classify_cached(&mut self, class: &'a str) -> Cls<'a> {
+        if self.stop_after_authors {
+            return classify(class);
+        }
+        if self.cls_cache.is_empty() {
+            self.cls_cache = vec![("", Cls::default()); 128];
+        }
+        let b = class.as_bytes();
+        let n = b.len();
+        let slot = (n * 31 + usize::from(b[0]) * 7 + usize::from(b[n / 2]) * 3 + usize::from(b[n - 1])) & 127;
+        let e = &mut self.cls_cache[slot];
+        if e.0 != class {
+            *e = (class, classify(class));
+        }
+        e.1
+    }
+
+    fn decide(&mut self, t: T, a: &Attrs<'a>) -> Act {
         let want_class = !a.class.is_empty() && (self.skip == 0 || self.authors > 0);
-        let c = if want_class { classify(a.class) } else { Cls::default() };
+        let c = if want_class { self.classify_cached(a.class) } else { Cls::default() };
         if t == T::SkipTag || c.has(F_SKIP) {
             return Act::Skip;
         }
@@ -957,8 +1204,7 @@ impl<'a> Parser<'a> {
             return self.decide_heading(n, &c);
         }
         if c.has(F_THEOREM) && t == T::Div {
-            self.pending_kind.clear();
-            self.pending_kind.push_str(c.thm_kind);
+            self.pending_kind = c.thm_kind;
             return Act::Theorem(0);
         }
         if c.has(F_BIBITEM) {
@@ -1043,7 +1289,30 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn decide_heading(&mut self, n: u8, c: &Cls) -> Act {
+    /// Heading levels: part/chapter exist only in some documents; `section` sits below whichever are present.
+    /// Returns (chapter level, section level).
+    fn levels(&mut self) -> (u8, u8) {
+        let b = self.b;
+        *self.levels.get_or_insert_with(|| {
+            // every `ltx_title_*` has an `x`, the one rare byte to anchor on
+            let (mut part, mut chapter) = (0, 0);
+            let mut i = 0;
+            while let Some(k) = find_byte(b, i, b'x') {
+                i = k + 1;
+                if k >= 2 && b[k - 2..].starts_with(b"ltx_title_") {
+                    let rest = &b[k + 8..];
+                    part |= u8::from(rest.starts_with(b"part"));
+                    chapter |= u8::from(rest.starts_with(b"chapter"));
+                    if part & chapter == 1 {
+                        break;
+                    }
+                }
+            }
+            (1 + part, 1 + part + chapter)
+        })
+    }
+
+    fn decide_heading(&mut self, n: u8, c: &Cls<'a>) -> Act {
         let kind = match c.title_kind {
             "document" => {
                 if self.title.is_empty() {
@@ -1053,14 +1322,15 @@ impl<'a> Parser<'a> {
                 }
             }
             "part" => HeadKind::Section(1),
-            "chapter" => HeadKind::Section(self.lvl_chapter),
-            "section" => HeadKind::Section(self.lvl_section),
+            "chapter" => HeadKind::Section(self.levels().0),
+            "section" => HeadKind::Section(self.levels().1),
             // back matter (and book appendices) sit at chapter level when the document has chapters
             "appendix" | "bibliography" | "abstract" | "acknowledgements" | "index" | "glossary" => {
-                HeadKind::Section(self.lvl_chapter.min(self.lvl_section))
+                let (chapter, section) = self.levels();
+                HeadKind::Section(chapter.min(section))
             }
-            "subsection" | "subappendix" => HeadKind::Section(self.lvl_section + 1),
-            "subsubsection" => HeadKind::Section(self.lvl_section + 2),
+            "subsection" | "subappendix" => HeadKind::Section(self.levels().1 + 1),
+            "subsubsection" => HeadKind::Section(self.levels().1 + 2),
             "paragraph" | "subparagraph" | "theorem" | "proof" => return self.heading_runin(c),
             "" if !c.has(F_TITLE) => {
                 if n == 1 && self.title.is_empty() {
@@ -1131,18 +1401,20 @@ impl<'a> Parser<'a> {
             Act::Theorem(_) => {
                 self.block_break();
                 self.flush_break();
-                let sec = self.sec_open.last().map(|&k| self.secs[k].id.clone()).unwrap_or_default();
-                let at = self.md.len();
-                self.thm_stack.push(self.items.len());
-                act = Act::Theorem(self.items.len());
-                self.items.push(ItemBuild {
-                    start: at,
-                    end: at,
-                    body_start: at,
-                    label: String::new(),
-                    class_kind: self.pending_kind.clone(),
-                    sec,
-                });
+                if self.want_items {
+                    let sec = self.sec_open.last().copied();
+                    let at = self.md.len();
+                    self.thm_stack.push(self.items.len());
+                    act = Act::Theorem(self.items.len());
+                    self.items.push(ItemBuild {
+                        start: at,
+                        end: at,
+                        body_start: at,
+                        label: String::new(),
+                        class_kind: self.pending_kind,
+                        sec,
+                    });
+                }
             }
             Act::Note => {
                 self.sp = true;
@@ -1221,13 +1493,15 @@ impl<'a> Parser<'a> {
                 self.runin = false;
                 self.flush_break();
                 let at = self.md.len();
-                self.bib = Some(BibState { start: at, text_start: at, tag: String::new(), hrefs: String::new() });
+                let (tag, hrefs) = (std::mem::take(&mut self.spare_tag), std::mem::take(&mut self.spare_hrefs));
+                self.bib = Some(BibState { start: at, text_start: at, tag, hrefs });
             }
             Act::BibBlock => self.sp = true,
             Act::Sup(_) | Act::Sub(_) => {
                 self.sp = false;
                 self.flush_break();
                 let sup = matches!(act, Act::Sup(_));
+                self.supsub += 1;
                 self.md.push(if sup { '^' } else { '_' });
                 act = if sup { Act::Sup(self.md.len()) } else { Act::Sub(self.md.len()) };
             }
@@ -1277,6 +1551,7 @@ impl<'a> Parser<'a> {
                 if self.cap_depth == 0 {
                     let raw = std::mem::take(&mut self.cap);
                     self.finish_contact(kind, &raw);
+                    self.cap = raw;
                 }
             }
             Act::Block => self.block_break(),
@@ -1294,8 +1569,11 @@ impl<'a> Parser<'a> {
             Act::Runin { start, thm } => self.close_runin(start, thm),
             Act::Theorem(idx) => {
                 self.block_break();
-                self.thm_stack.pop();
-                self.items[idx].end = self.md.len();
+                if self.want_items {
+                    self.thm_stack.pop();
+                    self.items[idx].end = self.md.len();
+                    self.item_hi = self.item_hi.max(self.md.len());
+                }
             }
             Act::Note => {
                 while self.md.ends_with(' ') {
@@ -1372,22 +1650,32 @@ impl<'a> Parser<'a> {
                 self.runin = true;
             }
             Act::BibItem => {
-                if let Some(b) = self.bib.take() {
-                    let text = collapse_ws(&self.md[b.text_start.min(self.md.len())..]);
-                    let n = self.refs.len() as u32 + 1;
-                    self.refs.push(make_ref(n, &b.tag, text, &b.hrefs));
+                if let Some(mut b) = self.bib.take() {
+                    if self.want_refs {
+                        let text = collapse_ws(&self.md[b.text_start.min(self.md.len())..]);
+                        let n = self.refs.len() as u32 + 1;
+                        self.refs.push(make_ref_with(n, &b.tag, text, &b.hrefs, &mut self.dec));
+                    }
+                    b.tag.clear();
+                    b.hrefs.clear();
+                    self.spare_tag = b.tag;
+                    self.spare_hrefs = b.hrefs;
                 }
                 self.line_break();
             }
             Act::BibTag => {
-                if let Some(b) = self.bib.as_mut() {
-                    b.tag = self.md[b.start.min(self.md.len())..].trim().to_string();
-                    b.text_start = self.md.len();
+                if self.want_refs {
+                    if let Some(b) = self.bib.as_mut() {
+                        b.tag.clear();
+                        b.tag.push_str(self.md[b.start.min(self.md.len())..].trim());
+                        b.text_start = self.md.len();
+                    }
                 }
                 self.sp = true;
             }
             Act::BibBlock => self.sp = true,
             Act::Sup(start) | Act::Sub(start) => {
+                self.supsub -= 1;
                 if start <= self.md.len() {
                     let n = self.md.len() - start;
                     if n == 0 {
@@ -1411,13 +1699,13 @@ impl<'a> Parser<'a> {
     fn close_heading(&mut self) {
         let Some(h) = self.head.take() else { return };
         let end_tag = h.tag_end;
-        let content = self.md[h.content_start.min(self.md.len())..].trim().to_string();
+        let empty = self.md[h.content_start.min(self.md.len())..].trim().is_empty();
+        while self.md.ends_with(' ') {
+            self.md.pop();
+        }
         match h.kind {
             HeadKind::Bold => {
-                while self.md.ends_with(' ') {
-                    self.md.pop();
-                }
-                if content.is_empty() {
+                if empty {
                     self.md.truncate(h.line_start);
                 } else {
                     self.md.push_str("**");
@@ -1425,33 +1713,25 @@ impl<'a> Parser<'a> {
                 self.block_break();
             }
             HeadKind::Doc => {
-                while self.md.ends_with(' ') {
-                    self.md.pop();
-                }
-                if content.is_empty() {
+                if empty {
                     self.md.truncate(h.line_start);
                 } else {
-                    self.title = content;
+                    self.title = self.md[h.content_start..].trim().to_string();
                 }
                 self.block_break();
             }
             HeadKind::Section(level) => {
-                while self.md.ends_with(' ') {
-                    self.md.pop();
-                }
-                let (id, title) = match end_tag {
-                    Some(te) if te > h.tag_start && te <= self.md.len() => {
-                        let tag = self.md[h.tag_start..te].trim();
-                        let title = self.md[te..].trim().to_string();
-                        (section_id_from_tag(tag), title)
-                    }
-                    _ => (None, content.clone()),
-                };
-                if content.is_empty() {
+                if empty {
                     self.md.truncate(h.line_start);
                     self.block_break();
                     return;
                 }
+                let (id, title) = match end_tag {
+                    Some(te) if te > h.tag_start && te <= self.md.len() => {
+                        (section_id_from_tag(self.md[h.tag_start..te].trim()), self.md[te..].trim().to_string())
+                    }
+                    _ => (None, self.md[h.content_start..].trim().to_string()),
+                };
                 let id = id.unwrap_or_else(|| {
                     self.sec_seq += 1;
                     format!("s{}", self.sec_seq)
@@ -1483,7 +1763,7 @@ impl<'a> Parser<'a> {
             self.md.truncate(start.saturating_sub(2));
             return;
         }
-        if thm {
+        if thm && self.want_items {
             let label = self.md[start..].trim_end_matches(['.', ':', ' ']).to_string();
             if let Some(&k) = self.thm_stack.last() {
                 self.items[k].label = label;
@@ -1567,26 +1847,103 @@ impl<'a> Parser<'a> {
         if self.skip > 0 {
             return;
         }
-        let t = decode_entities(raw);
-        if self.keep_ws > 0 {
-            self.raw_text(&t);
+        if self.keep_ws == 0 && find_byte(raw.as_bytes(), 0, b'&').is_none() {
+            if self.emit() {
+                self.words(raw);
+            } else {
+                self.text_unwritten(raw);
+            }
             return;
         }
-        let lead = t.starts_with(char::is_whitespace);
-        let mut first = true;
-        for w in t.split_whitespace() {
-            if !first || lead {
-                self.sp = true;
-            }
-            first = false;
-            self.flush_text();
-            self.md.push_str(w);
+        let mut dec = std::mem::take(&mut self.dec);
+        let t = if find_byte(raw.as_bytes(), 0, b'&').is_some() {
+            dec.clear();
+            decode_into(raw, &mut dec);
+            dec.as_str()
+        } else {
+            raw
+        };
+        if self.keep_ws > 0 {
+            self.raw_text(t);
+        } else if self.emit() {
+            self.words(t);
+        } else {
+            self.text_unwritten(t);
         }
-        if first {
-            if lead {
+        self.dec = dec;
+    }
+
+    /// Markdown nobody reads (outside headings / theorems / bibliography entries when only those are
+    /// wanted) still has to move the layout state exactly as the real text would, and leave the same
+    /// kind of last byte; one placeholder byte stands for the words.
+    fn text_unwritten(&mut self, raw: &str) {
+        // closing frames look at the real characters: row cleanup trims `|` (possibly an entity), and a
+        // list tag made of one non-alphanumeric char is dropped
+        let mut ch = raw.trim().chars();
+        let lone_symbol = matches!((ch.next(), ch.next()), (Some(c), None) if !c.is_alphanumeric());
+        if lone_symbol || raw.bytes().any(|b| b == b'|' || b == b'&') {
+            return self.words(raw);
+        }
+        let lead = skip_ws(raw, 0);
+        if lead > 0 {
+            self.sp = true;
+        }
+        if lead == raw.len() {
+            return;
+        }
+        self.flush_text();
+        self.md.push('x');
+        if raw.ends_with(char::is_whitespace) {
+            self.sp = true;
+        }
+    }
+
+    /// Whether markdown text has to be written right now.
+    fn emit(&self) -> bool {
+        self.want_md
+            || self.head.is_some()
+            || self.supsub > 0
+            || (self.want_items && !self.thm_stack.is_empty())
+            || (self.want_refs && self.bib.is_some())
+            || !self.row_stack.is_empty()
+            || (self.want_items && self.md.len() < self.item_hi)
+    }
+
+    /// Append whitespace-normalised words, one separating space between them.
+    fn words(&mut self, t: &str) {
+        let n = t.len();
+        let b = t.as_bytes();
+        let mut i = skip_ws(t, 0);
+        if i == n {
+            // empty or all whitespace
+            if n > 0 {
                 self.sp = true;
             }
-        } else if t.ends_with(char::is_whitespace) {
+            return;
+        }
+        if i > 0 {
+            self.sp = true;
+        }
+        // `from..i` is copied as is while words are separated by one plain space
+        let mut from = i;
+        i = skip_word(t, i);
+        self.flush_text();
+        loop {
+            let j = skip_ws(t, i);
+            if j == n {
+                self.md.push_str(&t[from..i]);
+                break;
+            }
+            if j == i + 1 && b[i] == b' ' {
+                i = skip_word(t, j);
+            } else {
+                self.md.push_str(&t[from..i]);
+                self.md.push(' ');
+                from = j;
+                i = skip_word(t, j);
+            }
+        }
+        if i < n {
             self.sp = true;
         }
     }
@@ -1632,7 +1989,26 @@ impl<'a> Parser<'a> {
     }
 
     fn math(&mut self, alt: &str, display: &str, math_start: usize) {
-        let mut tex = clean_tex(alt);
+        let block = display == "block" && self.cell_depth == 0 && self.head.is_none();
+        let mut dec = std::mem::take(&mut self.dec);
+        let mut tex = std::mem::take(&mut self.tex);
+        if !self.emit() {
+            let t = decoded(alt, &mut dec).trim();
+            if !t.is_empty() && !has_displaystyle(t) {
+                if block {
+                    self.block_break();
+                }
+                self.flush_text();
+                self.md.push('x');
+                if block {
+                    self.block_break();
+                }
+                self.dec = dec;
+                self.tex = tex;
+                return;
+            }
+        }
+        clean_tex(alt, &mut dec, &mut tex);
         if tex.is_empty() {
             // no alttext: fall back to the TeX annotation
             let end = self.s[math_start..].find("</math").map(|e| math_start + e).unwrap_or(self.b.len());
@@ -1641,35 +2017,34 @@ impl<'a> Parser<'a> {
                 if let Some(g) = inner[k..].find('>') {
                     let from = k + g + 1;
                     let to = inner[from..].find("</annotation").map(|e| from + e).unwrap_or(inner.len());
-                    tex = clean_tex(&inner[from..to]);
+                    clean_tex(&inner[from..to], &mut dec, &mut tex);
                 }
             }
-            if tex.is_empty() {
-                return;
+        }
+        if !tex.is_empty() {
+            if block {
+                self.block_break();
+                self.flush_text();
+                self.md.push_str("$$");
+                self.md.push_str(&tex);
+                self.md.push_str("$$");
+                self.block_break();
+            } else {
+                self.flush_text();
+                self.md.push('$');
+                self.md.push_str(&tex);
+                self.md.push('$');
             }
         }
-        if display == "block" && self.cell_depth == 0 && self.head.is_none() {
-            self.block_break();
-            self.flush_text();
-            self.md.push_str("$$");
-            self.md.push_str(&tex);
-            self.md.push_str("$$");
-            self.block_break();
-        } else {
-            self.flush_text();
-            self.md.push('$');
-            self.md.push_str(&tex);
-            self.md.push('$');
-        }
+        self.dec = dec;
+        self.tex = tex;
     }
 
     fn skip_math(&mut self) {
         let from = self.i;
-        self.i = match self.s[from..].find("</math").or_else(|| self.s[from..].find("</MATH")) {
-            Some(e) => {
-                let at = from + e;
-                self.s[at..].find('>').map(|g| at + g + 1).unwrap_or(self.b.len())
-            }
+        let at = find_pat(self.b, from, b"</math", &MATH_END_LO).or_else(|| find_pat(self.b, from, b"</MATH", &MATH_END_UP));
+        self.i = match at {
+            Some(at) => self.s[at..].find('>').map(|g| at + g + 1).unwrap_or(self.b.len()),
             None => self.b.len(),
         };
     }
@@ -1678,38 +2053,61 @@ impl<'a> Parser<'a> {
 
     fn finish_contact(&mut self, kind: u8, raw: &str) {
         if kind == 0 {
-            let name = collapse_ws(raw);
-            if !name.is_empty() {
-                self.names.push(name);
+            let from = self.names.len();
+            collapse_into(&mut self.names, raw);
+            if self.names.len() > from {
+                self.names.push('\n');
             }
             return;
         }
+        let mut low = std::mem::take(&mut self.dec);
         for line in raw.split('\n') {
             let mut line = strip_emails(line);
             if kind == 2 {
-                for name in &self.names {
-                    if let Some(rest) = line.trim_start().strip_prefix(name.as_str()) {
+                for name in self.names.split_terminator('\n') {
+                    if let Some(rest) = line.trim_start().strip_prefix(name) {
                         if let Some(rest) = rest.trim_start().strip_prefix(',') {
-                            line = rest.to_string();
+                            line = Cow::Owned(rest.to_string());
                             break;
                         }
                     }
                 }
             }
             if kind == 3 {
-                for sentence in split_sentences(&line) {
-                    if looks_like_institution(&sentence) && !looks_like_funding(&sentence) {
-                        self.add_inst(&sentence);
+                for sentence in sentences(&line) {
+                    if sentence.len() <= 200 {
+                        lower_into(sentence, &mut low);
+                        if INST_KW.iter().any(|k| low.contains(k)) && !FUNDING_KW.iter().any(|k| low.contains(k)) {
+                            self.add_inst(sentence);
+                        }
                     }
                 }
             } else {
                 self.add_inst(&line);
             }
         }
+        self.dec = low;
     }
 
     fn add_inst(&mut self, raw: &str) {
-        let mut t = collapse_ws(raw);
+        // whitespace-collapsed copy of `raw` (never longer than it), on the stack when short
+        let mut stack = [0u8; 512];
+        let mut heap = String::new();
+        let t: &str = if raw.len() <= stack.len() {
+            let mut n = 0;
+            for (i, w) in raw.split_whitespace().enumerate() {
+                if i > 0 {
+                    stack[n] = b' ';
+                    n += 1;
+                }
+                stack[n..n + w.len()].copy_from_slice(w.as_bytes());
+                n += w.len();
+            }
+            std::str::from_utf8(&stack[..n]).unwrap_or("")
+        } else {
+            collapse_into(&mut heap, raw);
+            &heap
+        };
         // leading footnote marks: "††", "1 ", "* "
         let t0 = t.trim_start_matches(|c: char| !c.is_alphanumeric() && c != '(');
         let mut t1 = t0;
@@ -1719,10 +2117,9 @@ impl<'a> Parser<'a> {
                 t1 = &t1[2..];
             }
         }
-        let cleaned = t1.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ' ' | '-' | '–' | '—')).to_string();
-        t = cleaned;
-        if t.chars().count() >= 2 && !self.insts.contains(&t) {
-            self.insts.push(t);
+        let cleaned = t1.trim_matches(|c: char| matches!(c, '.' | ',' | ';' | ':' | ' ' | '-' | '–' | '—'));
+        if cleaned.chars().count() >= 2 && !self.insts.iter().any(|i| i == cleaned) {
+            self.insts.push(cleaned.to_string());
         }
     }
 
@@ -1742,12 +2139,12 @@ impl<'a> Parser<'a> {
         }
         let title = if self.title.is_empty() { head_title } else { std::mem::take(&mut self.title) };
 
-        let mut built: Vec<(usize, Item)> = Vec::new();
-        for ib in &self.items {
+        let mut built: Vec<(usize, Item)> = Vec::with_capacity(self.items.len());
+        for ib in &mut self.items {
             let start = ib.start.min(mlen);
             let end = ib.end.clamp(start, mlen);
             let by_label = label_kind(&ib.label);
-            let by_class = kind_word(&ib.class_kind);
+            let by_class = kind_word(ib.class_kind);
             let kind = match by_label.or(by_class) {
                 Some(KW::Proof) => continue,
                 Some(KW::Kind(k)) => k,
@@ -1755,8 +2152,9 @@ impl<'a> Parser<'a> {
             };
             let body_start = ib.body_start.clamp(start, end);
             let text = self.md[body_start..end].trim().to_string();
-            let label = if ib.label.is_empty() { kind_name(kind).to_string() } else { ib.label.clone() };
-            built.push((start, Item { kind, label, sec: ib.sec.clone(), text }));
+            let label = if ib.label.is_empty() { kind_name(kind).to_string() } else { std::mem::take(&mut ib.label) };
+            let sec = ib.sec.map(|k| self.secs[k].id.clone()).unwrap_or_default();
+            built.push((start, Item { kind, label, sec, text }));
         }
         built.sort_by_key(|(p, _)| *p);
         Doc {
@@ -1769,31 +2167,68 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn clean_tex(alt: &str) -> String {
-    let alt = decode_entities(alt);
-    let t = alt.trim();
-    if t.is_empty() {
-        return String::new();
+/// `alt` with entities decoded, in `dec` when there was something to decode.
+fn decoded<'b>(alt: &'b str, dec: &'b mut String) -> &'b str {
+    if !alt.contains('&') {
+        return alt;
     }
-    let needs = t.contains('\n') || t.contains("\\displaystyle") || t.contains("  ") || t.contains('\t');
-    if !needs {
-        return t.to_string();
+    dec.clear();
+    decode_into(alt, dec);
+    dec.as_str()
+}
+
+fn has_displaystyle(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = 0;
+    while let Some(k) = find_byte(b, i, b'\\') {
+        if b[k..].starts_with(b"\\displaystyle") {
+            return true;
+        }
+        i = k + 1;
     }
-    let mut out = String::with_capacity(t.len());
-    let mut rest = t;
-    // drop \displaystyle (pure noise for an LLM reader)
-    let tmp;
-    if rest.contains("\\displaystyle") {
-        tmp = rest.replace("\\displaystyle", "");
-        rest = &tmp;
+    false
+}
+
+/// `t` has a newline, tab, double space or `\displaystyle`.
+fn needs_clean(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.iter().enumerate().any(|(i, &c)| match c {
+        b'\n' | b'\t' => true,
+        b' ' => b.get(i + 1) == Some(&b' '),
+        _ => false,
+    }) || has_displaystyle(t)
+}
+
+/// Cleaned TeX of a math node into `out` (replacing its content): entities decoded, `\displaystyle`
+/// dropped (pure noise for an LLM reader), whitespace collapsed.
+fn clean_tex(alt: &str, dec: &mut String, out: &mut String) {
+    out.clear();
+    let t = decoded(alt, dec).trim();
+    if !needs_clean(t) {
+        out.push_str(t);
+        return;
     }
-    for w in rest.split_whitespace() {
-        if !out.is_empty() {
+    // words are split at whitespace only, so a word can continue across a dropped `\displaystyle`
+    let mut mid_word = false;
+    for seg in t.split("\\displaystyle") {
+        let lead = seg.starts_with(char::is_whitespace);
+        let mut words = seg.split_whitespace();
+        let Some(first) = words.next() else {
+            if lead {
+                mid_word = false;
+            }
+            continue;
+        };
+        if !(mid_word && !lead) && !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(w);
+        out.push_str(first);
+        for w in words {
+            out.push(' ');
+            out.push_str(w);
+        }
+        mid_word = !seg.ends_with(char::is_whitespace);
     }
-    out
 }
 
 /// "2.1 " -> "2.1", "Appendix A " -> "A", "" -> None.
@@ -1808,6 +2243,11 @@ fn section_id_from_tag(tag: &str) -> Option<String> {
 }
 
 pub(crate) fn make_ref(fallback_n: u32, tag: &str, text: String, hrefs: &str) -> Ref {
+    make_ref_with(fallback_n, tag, text, hrefs, &mut String::new())
+}
+
+/// `make_ref` with a caller-owned scratch buffer for the text + links search haystack.
+fn make_ref_with(fallback_n: u32, tag: &str, text: String, hrefs: &str, both: &mut String) -> Ref {
     let t = tag.trim();
     let digits = t.trim_matches(|c: char| matches!(c, '[' | ']' | '.' | '(' | ')' | ' '));
     let n = if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -1815,12 +2255,14 @@ pub(crate) fn make_ref(fallback_n: u32, tag: &str, text: String, hrefs: &str) ->
     } else {
         fallback_n
     };
-    let both;
     let hay: &str = if hrefs.is_empty() {
         &text
     } else {
-        both = format!("{} {}", text, hrefs);
-        &both
+        both.clear();
+        both.push_str(&text);
+        both.push(' ');
+        both.push_str(hrefs);
+        both
     };
     let mut arxiv = find_arxiv_id(hay);
     let mut doi = find_doi(hay);
@@ -1948,9 +2390,9 @@ fn find_doi(s: &str) -> Option<String> {
 }
 
 /// Remove e-mail addresses (and `{a, b}@dom` groups) from a line.
-fn strip_emails(line: &str) -> String {
+fn strip_emails(line: &str) -> Cow<'_, str> {
     if !line.contains('@') {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
     let mut s = line.to_string();
     while let Some(at) = s.find('@') {
@@ -1966,8 +2408,8 @@ fn strip_emails(line: &str) -> String {
     // "E-mail:" style labels left behind
     let mut out = String::new();
     for w in s.split_whitespace() {
-        let lw = w.to_ascii_lowercase();
-        if matches!(lw.as_str(), "e-mail:" | "email:" | "e-mail" | "email" | "emails:") || lw.starts_with("http") {
+        let label = ["e-mail:", "email:", "e-mail", "email", "emails:"].iter().any(|l| w.eq_ignore_ascii_case(l));
+        if label || w.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")) {
             continue;
         }
         if !out.is_empty() {
@@ -1975,45 +2417,54 @@ fn strip_emails(line: &str) -> String {
         }
         out.push_str(w);
     }
-    out
+    Cow::Owned(out)
 }
 
-fn split_sentences(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let b: Vec<char> = s.chars().collect();
-    let mut k = 0;
-    while k < b.len() {
-        cur.push(b[k]);
-        if b[k] == '.' && k > 0 && !b[k - 1].is_ascii_digit() && k + 2 < b.len() && b[k + 1] == ' ' && b[k + 2].is_uppercase() {
-            out.push(std::mem::take(&mut cur));
-            k += 1; // skip the space
+/// Sentences of `s`: split after a `.` that follows a non-digit and precedes ` ` + an uppercase letter.
+fn sentences(s: &str) -> impl Iterator<Item = &str> {
+    let mut start = 0;
+    let mut prev: Option<char> = None;
+    let mut it = s.char_indices();
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
         }
-        k += 1;
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    out
+        while let Some((i, c)) = it.next() {
+            if c == '.' && prev.is_some_and(|p| !p.is_ascii_digit()) && s[i + 1..].starts_with(' ') {
+                let after = &s[i + 2..];
+                if after.chars().next().is_some_and(char::is_uppercase) {
+                    let sentence = &s[start..i + 1];
+                    start = i + 2;
+                    it.next();
+                    prev = Some(' ');
+                    return Some(sentence);
+                }
+            }
+            prev = Some(c);
+        }
+        done = true;
+        let rest = &s[start..];
+        (!rest.trim().is_empty()).then_some(rest)
+    })
 }
 
-fn looks_like_institution(s: &str) -> bool {
-    const KW: [&str; 17] = [
-        "univers", "institut", "college", "school of", "department", "faculty", "laborator", "academy", "center",
-        "centre", "polytechn", "hospital", "max planck", "cnrs", "inria", "fakult", "dept",
-    ];
-    if s.len() > 200 {
-        return false;
-    }
-    let l = s.to_lowercase();
-    KW.iter().any(|k| l.contains(k))
-}
+const INST_KW: [&str; 17] = [
+    "univers", "institut", "college", "school of", "department", "faculty", "laborator", "academy", "center",
+    "centre", "polytechn", "hospital", "max planck", "cnrs", "inria", "fakult", "dept",
+];
 
-fn looks_like_funding(s: &str) -> bool {
-    const KW: [&str; 10] =
-        ["supported", "funded", "grant", "partially", "acknowledg", "equal contribution", "work done", "correspond", "thank", "fellowship"];
-    let l = s.to_lowercase();
-    KW.iter().any(|k| l.contains(k))
+const FUNDING_KW: [&str; 10] =
+    ["supported", "funded", "grant", "partially", "acknowledg", "equal contribution", "work done", "correspond", "thank", "fellowship"];
+
+/// `out` = `s.to_lowercase()` (without allocating for ASCII).
+fn lower_into(s: &str, out: &mut String) {
+    out.clear();
+    if s.is_ascii() {
+        out.extend(s.bytes().map(|b| b.to_ascii_lowercase() as char));
+    } else {
+        out.push_str(&s.to_lowercase());
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2216,6 +2667,8 @@ enum Node {
 struct Regex {
     alts: Vec<Vec<Node>>,
     ci: bool,
+    /// Bytes a non-empty match can start with (lead bytes only for non-ASCII); `None` = no filtering.
+    first: Option<Box<[bool; 256]>>,
 }
 
 struct RxParser {
@@ -2431,7 +2884,9 @@ impl Regex {
         if p.i != p.c.len() {
             return None;
         }
-        Some(Regex { alts, ci })
+        let mut first = Box::new([false; 256]);
+        let known = seq_alts_first(&alts, ci, &mut first);
+        Some(Regex { alts, ci, first: known.then_some(first) })
     }
 
     /// Returns true when a budget was exhausted during the scan.
@@ -2448,9 +2903,16 @@ impl Regex {
         let mut pos = 0usize;
         let n = text.len();
         let mut total = 0u64;
+        let tb = text.as_bytes();
         while pos <= n {
             if let Some(c) = first_lit {
                 match text[pos..].find(c) {
+                    Some(o) => pos += o,
+                    None => return m.blown.get(),
+                }
+            } else if let Some(first) = &self.first {
+                // positions that cannot start a match are skipped, and are not charged to the total budget
+                match tb[pos..].iter().position(|&b| first[b as usize]) {
                     Some(o) => pos += o,
                     None => return m.blown.get(),
                 }
@@ -2506,6 +2968,83 @@ fn simplify_group(mut g: Vec<Vec<Node>>) -> Node {
     Node::Group(g)
 }
 
+fn set_hit(neg: bool, items: &[SetItem], ci: bool, c: char) -> bool {
+    let hit = |ch: char| {
+        items.iter().any(|it| match it {
+            SetItem::Range(a, b) => *a <= ch && ch <= *b,
+            SetItem::Digit(p) => ch.is_ascii_digit() == *p,
+            SetItem::Word(p) => is_word(ch) == *p,
+            SetItem::Space(p) => ch.is_whitespace() == *p,
+        })
+    };
+    let mut h = hit(c);
+    if !h && ci {
+        h = hit(lower1(c)) || c.to_uppercase().next().is_some_and(&hit);
+    }
+    h != neg
+}
+
+/// Union of the bytes a non-empty match of `alts` can start with. Returns false when that cannot be
+/// bounded (case-insensitive non-ASCII literal).
+fn seq_alts_first(alts: &[Vec<Node>], ci: bool, set: &mut [bool; 256]) -> bool {
+    alts.iter().all(|a| seq_first(a, ci, set).is_some())
+}
+
+/// Adds the possible first bytes of `nodes` to `set`; `Some(nullable)`, or `None` when unbounded.
+fn seq_first(nodes: &[Node], ci: bool, set: &mut [bool; 256]) -> Option<bool> {
+    for n in nodes {
+        if !node_first(n, ci, set)? {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+fn node_first(n: &Node, ci: bool, set: &mut [bool; 256]) -> Option<bool> {
+    let all_lead = |set: &mut [bool; 256]| set[0xC0..].fill(true);
+    match n {
+        Node::Lit(c) => {
+            if ci {
+                if !c.is_ascii() {
+                    return None;
+                }
+                set[c.to_ascii_lowercase() as usize] = true;
+                set[c.to_ascii_uppercase() as usize] = true;
+                all_lead(set);
+            } else {
+                let mut b = [0u8; 4];
+                set[c.encode_utf8(&mut b).as_bytes()[0] as usize] = true;
+            }
+            Some(false)
+        }
+        Node::Any => {
+            for (b, v) in set.iter_mut().enumerate().take(0x80) {
+                *v |= b != b'\n' as usize;
+            }
+            all_lead(set);
+            Some(false)
+        }
+        Node::Set { neg, items } => {
+            for b in 0..0x80u8 {
+                if set_hit(*neg, items, ci, b as char) {
+                    set[b as usize] = true;
+                }
+            }
+            all_lead(set);
+            Some(false)
+        }
+        Node::Bol | Node::Eol | Node::WordB(_) => Some(true),
+        Node::Group(alts) => {
+            let mut nullable = false;
+            for a in alts {
+                nullable |= seq_first(a, ci, set)?;
+            }
+            Some(nullable)
+        }
+        Node::Rep { node, min, .. } => Some(node_first(node, ci, set)? || *min == 0),
+    }
+}
+
 impl Matcher<'_> {
     fn bump(&self) -> bool {
         let s = self.steps.get() + 1;
@@ -2535,21 +3074,7 @@ impl Matcher<'_> {
         let ok = match node {
             Node::Lit(l) => self.eq(c, *l),
             Node::Any => c != '\n',
-            Node::Set { neg, items } => {
-                let hit = |ch: char| {
-                    items.iter().any(|it| match it {
-                        SetItem::Range(a, b) => *a <= ch && ch <= *b,
-                        SetItem::Digit(p) => ch.is_ascii_digit() == *p,
-                        SetItem::Word(p) => is_word(ch) == *p,
-                        SetItem::Space(p) => ch.is_whitespace() == *p,
-                    })
-                };
-                let mut h = hit(c);
-                if !h && self.ci {
-                    h = hit(lower1(c)) || c.to_uppercase().next().is_some_and(&hit);
-                }
-                h != *neg
-            }
+            Node::Set { neg, items } => set_hit(*neg, items, self.ci, c),
             _ => return None,
         };
         if ok {
@@ -3455,5 +3980,227 @@ mod review_regressions {
     fn abs_meta_unterminated_cell_with_multibyte_tail() {
         let page = format!("<td class=\"msc-classes\">{}", "€".repeat(1000));
         let _ = abs_meta(&page);
+    }
+}
+
+#[cfg(test)]
+mod fast_paths {
+    use super::*;
+
+    fn pages() -> Vec<(String, String)> {
+        let dir = format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
+        let mut v: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().into_string().unwrap();
+                (n.starts_with("html_") && !n.starts_with("html_abs_")).then(|| (n.clone(), std::fs::read_to_string(format!("{dir}/{n}")).unwrap()))
+            })
+            .collect();
+        v.sort();
+        v.push((
+            "list+theorem".into(),
+            concat!(
+                "<article><h1 class=\"ltx_title ltx_title_document\">T &amp; U</h1>",
+                "<h2 class=\"ltx_title ltx_title_section\"><span class=\"ltx_tag ltx_tag_section\">1 </span>Intro</h2>",
+                "<ul class=\"ltx_itemize\"><li class=\"ltx_item\"><span class=\"ltx_tag ltx_tag_item\">\u{2022}</span>",
+                "<div class=\"ltx_para\"><p class=\"ltx_p\">before <math alttext=\"x\"><mi>x</mi></math> text</p></div>",
+                "<div class=\"ltx_theorem ltx_theorem_problem\"><h6 class=\"ltx_title ltx_runin ltx_title_theorem\">Problem 1.</h6>",
+                "<p>Is <math alttext=\"\\displaystyle a &lt; b\" display=\"block\"><mi>a</mi></math>\n true?&nbsp;</p></div></li></ul>",
+                "<span class=\"ltx_note ltx_role_footnote\">note <b>here</b></span></article>"
+            )
+            .into(),
+        ));
+        v.push((
+            "table+bib".into(),
+            concat!(
+                "<article><section><h2 class=\"ltx_title ltx_title_section\">Data</h2><table class=\"ltx_tabular\"><tr><td>a  b</td><td>",
+                "<div class=\"ltx_theorem ltx_theorem_lemma\"><h6 class=\"ltx_title ltx_runin ltx_title_theorem\">Lemma 2.</h6>cell</div></td></tr></table></section>",
+                "<ul class=\"ltx_biblist\"><li class=\"ltx_bibitem\"><span class=\"ltx_tag ltx_tag_bibitem\">[3]</span>",
+                "<span class=\"ltx_bibblock\">A. B. <a href=\"https://arxiv.org/abs/1706.03762\">Attention</a>, 2017.</span></li></ul></article>"
+            )
+            .into(),
+        ));
+        v.push((
+            "pipes_in_cells".into(),
+            "<article><table><tr><td>|<div class=\"ltx_theorem ltx_theorem_problem\">|||||</div></td></tr></table><h2>\u{1F600}abcdef</h2></article>".into(),
+        ));
+        v.push((
+            "bullet_tag_after_theorem".into(),
+            "<article><table><tr><td>\n<div class=\"ltx_theorem ltx_theorem_problem\">foo|</div>\n<ul><li><span class=\"ltx_tag ltx_tag_item\">\u{2022}</span></li></ul>\n</td></tr></table></article>".into(),
+        ));
+        v.push((
+            "entity_pipe_after_theorem".into(),
+            "<article><table><tr><td><div class=\"ltx_theorem ltx_theorem_problem\">foo&#124;</div></td><td>&#124;</td></tr></table></article>".into(),
+        ));
+        v.push((
+            "pipe_after_theorem".into(),
+            "<article><table><tr><td><div class=\"ltx_theorem ltx_theorem_problem\">foo|</div></td><td>|</td></tr></table></article>".into(),
+        ));
+        v
+    }
+
+    fn dbg<T: std::fmt::Debug>(t: &T) -> String {
+        format!("{t:?}")
+    }
+
+    #[test]
+    fn want_modes_match_the_full_parse() {
+        for (name, h) in pages() {
+            let all = parse(&h);
+            let text = parse_for(&h, Want::Text);
+            assert_eq!((&text.title, &text.md, dbg(&text.sections)), (&all.title, &all.md, dbg(&all.sections)), "{name}: text");
+            let outline = parse_for(&h, Want::Outline);
+            let key = |d: &Doc| d.sections.iter().map(|s| (s.id.clone(), s.level, s.title.clone())).collect::<Vec<_>>();
+            assert_eq!((&outline.title, key(&outline)), (&all.title, key(&all)), "{name}: outline");
+            let items = parse_for(&h, Want::Items);
+            assert_eq!((&items.title, dbg(&items.items)), (&all.title, dbg(&all.items)), "{name}: items");
+            let refs = parse_for(&h, Want::Refs);
+            assert_eq!((&refs.title, dbg(&refs.refs)), (&all.title, dbg(&all.refs)), "{name}: refs");
+        }
+    }
+
+    #[test]
+    fn want_modes_match_the_full_parse_on_random_documents() {
+        const TAGS: &[(&str, &str)] = &[
+            ("<table>", "</table>"), ("<tr>", "</tr>"), ("<td>", "</td>"), ("<div class=\"ltx_theorem ltx_theorem_problem\">", "</div>"),
+            ("<div class=\"ltx_theorem ltx_theorem_lemma\">", "</div>"), ("<ul>", "</ul>"), ("<li>", "</li>"),
+            ("<span class=\"ltx_tag ltx_tag_item\">", "</span>"), ("<h2 class=\"ltx_title ltx_title_section\">", "</h2>"),
+            ("<h6 class=\"ltx_title ltx_runin ltx_title_theorem\">", "</h6>"), ("<p>", "</p>"), ("<sup>", "</sup>"), ("<sub>", "</sub>"),
+            ("<dl>", "</dl>"), ("<dt>", "</dt>"), ("<figure>", "</figure>"), ("<figcaption>", "</figcaption>"), ("<span class=\"ltx_note\">", "</span>"),
+            ("<ul class=\"ltx_biblist\">", "</ul>"), ("<li class=\"ltx_bibitem\">", "</li>"), ("<span class=\"ltx_tag ltx_tag_bibitem\">", "</span>"),
+            ("<span class=\"ltx_bibblock\">", "</span>"), ("<math><mi>x</mi>", "</math>"),
+        ];
+        const TEXT: &[&str] = &["|", "||", " | ", "foo", "foo|", "\u{2022}", "-", "&bull;", "&#124;", "&amp;", "x", " ", "\u{1F600}abc", "[1]", "a b  c", "1.", "(", "\n", "é"];
+        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rnd = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        thread_local!(static LOC: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) });
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|i| LOC.with(|l| *l.borrow_mut() = i.location().map(|x| x.to_string()).unwrap_or_default())));
+        let mut fails: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+        let iters: usize = std::env::var("ARX_FUZZ").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
+        for _ in 0..iters {
+            let mut h = String::from("<article>");
+            let mut open: Vec<&str> = Vec::new();
+            for _ in 0..rnd(24) + 2 {
+                match rnd(3) {
+                    0 => {
+                        let (o, c) = TAGS[rnd(TAGS.len())];
+                        h.push_str(o);
+                        open.push(c);
+                    }
+                    1 => h.push_str(open.pop().unwrap_or("")),
+                    _ => h.push_str(TEXT[rnd(TEXT.len())]),
+                }
+            }
+            while let Some(c) = open.pop() {
+                h.push_str(c);
+            }
+            h.push_str("</article>");
+            let key = |d: &Doc| d.sections.iter().map(|s| (s.id.clone(), s.level, s.title.clone())).collect::<Vec<_>>();
+            let all = std::panic::catch_unwind(|| parse(&h));
+            let all = match all {
+                Ok(a) => a,
+                Err(_) => {
+                    *fails.entry(format!("All panics at {}", LOC.with(|l| l.borrow().clone()))).or_insert((0, h.clone())) = (0, h.clone());
+                    continue;
+                }
+            };
+            for w in [Want::Items, Want::Refs, Want::Outline, Want::Text] {
+                let Ok(got) = std::panic::catch_unwind(|| parse_for(&h, w)) else {
+                    let e = fails.entry(format!("{w:?} panics at {}", LOC.with(|l| l.borrow().clone()))).or_insert((0, h.clone()));
+                    e.0 += 1;
+                    continue;
+                };
+                let same = match w {
+                    Want::Items => dbg(&all.items) == dbg(&got.items),
+                    Want::Refs => dbg(&all.refs) == dbg(&got.refs),
+                    Want::Outline => key(&all) == key(&got),
+                    _ => all.md == got.md,
+                };
+                if !same {
+                    fails.entry(format!("{w:?} differs")).or_insert((0, h.clone())).0 += 1;
+                }
+            }
+        }
+        std::panic::set_hook(prev);
+        for (k, (n, h)) in &fails {
+            println!("{k} x{n}: {h:?}");
+        }
+        assert!(fails.keys().all(|k| k.starts_with("All panics")), "{fails:#?}"); // `All` panics on a few degenerate pages, as the original parser did
+    }
+
+    #[test]
+    fn regex_start_filter_keeps_case_folded_and_unicode_matches() {
+        let pos = |text: &str, pat: &str| grep(text, &[], pat, 0, 9).iter().map(|h| h.pos).collect::<Vec<_>>();
+        assert_eq!(pos("x\u{212A}y", "/k/i"), [1], "KELVIN SIGN folds to k");
+        assert_eq!(pos("a\u{130}b", "/i/i"), [1], "dotted capital I lowercases to i");
+        assert_eq!(pos("h\u{e9}\u{e9}", "/\u{e9}+/"), [1]);
+        assert_eq!(pos("baab", "/a*/"), [1]);
+        assert!(pos("abc\n\nd", "/^$/").is_empty());
+        assert_eq!(pos("ab\n#c", "/^#/"), [3]);
+    }
+
+    #[test]
+    fn byte_and_pattern_search_agree_with_the_naive_scan() {
+        let s = b"0123456789abcdef</math>tail</MATH></mat</math";
+        for from in 0..=s.len() {
+            for x in [b'<', b'>', b'0', b'z'] {
+                assert_eq!(find_byte(s, from, x), s[from..].iter().position(|&c| c == x).map(|p| p + from), "byte {x} from {from}");
+            }
+            let naive = |p: &[u8]| s[from..].windows(p.len()).position(|w| w == p).map(|q| q + from);
+            assert_eq!(find_pat(s, from, b"</math", &MATH_END_LO), naive(b"</math"), "from {from}");
+            assert_eq!(find_pat(s, from, b"</MATH", &MATH_END_UP), naive(b"</MATH"), "from {from}");
+        }
+    }
+
+    #[test]
+    fn heading_levels_follow_part_and_chapter_anywhere_in_the_page() {
+        let levels = |html: &str| Parser::new(html, Want::Outline, 0).levels();
+        assert_eq!(levels("<x class=ltx_title_section>"), (1, 1));
+        assert_eq!(levels("ltx_title_part"), (2, 2));
+        assert_eq!(levels("xltx_title_chapter"), (1, 2));
+        assert_eq!(levels("ltx_title_ltx_title_chapter ltx_title_part"), (2, 3));
+        assert_eq!(levels("ltx_title_par ltx_title_chap ltx_ltx_title_"), (1, 1));
+        assert_eq!(levels(""), (1, 1));
+    }
+
+    #[test]
+    fn clean_tex_drops_displaystyle_and_collapses_words() {
+        let clean = |alt: &str| {
+            let (mut dec, mut out) = (String::new(), String::new());
+            clean_tex(alt, &mut dec, &mut out);
+            out
+        };
+        assert_eq!(clean(" \\displaystyle  x  y "), "x y");
+        assert_eq!(clean("a\\displaystyleb c"), "ab c");
+        assert_eq!(clean("a \\displaystyle b"), "a b");
+        assert_eq!(clean("x &lt; y\n\tz"), "x < y z");
+        assert_eq!(clean("\\displaystyle"), "");
+        assert_eq!(clean("  "), "");
+    }
+
+    #[test]
+    fn text_nodes_normalise_ascii_and_unicode_whitespace() {
+        let md = |body: &str| parse(&format!("<article><p>{body}</p></article>")).md;
+        assert_eq!(md("  a \n\t b   c  "), "a b c");
+        assert_eq!(md("a\u{a0}\u{2003}b \u{e9}  c"), "a b \u{e9} c");
+        assert_eq!(md("a<b>b</b> <i> c</i>"), "ab c");
+        assert_eq!(collapse_ws(" a \n b\u{a0}c "), "a b c");
+    }
+
+    #[test]
+    fn institution_sentences_split_after_period_and_capital() {
+        fn split(s: &str) -> Vec<&str> {
+            sentences(s).collect()
+        }
+        assert_eq!(split("Dept. of Math, Univ. of X. Supported by Y."), ["Dept. of Math, Univ. of X.", "Supported by Y."]);
+        assert_eq!(split("Grant 5. Funded by Z"), ["Grant 5. Funded by Z"]);
+        assert_eq!(split(". A"), [". A"]);
+        assert!(split("  ").is_empty());
     }
 }

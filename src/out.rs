@@ -7,6 +7,7 @@
 //! Literal `|` inside a value is written `\|`.
 
 use crate::args::Args;
+use crate::html::collapse_into as push_collapsed;
 use crate::model::*;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -186,12 +187,7 @@ fn collapse(s: &str) -> Cow<'_, str> {
 
 fn collapse_owned(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for w in s.split_whitespace() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(w);
-    }
+    push_collapsed(&mut out, s);
     out
 }
 
@@ -1026,26 +1022,30 @@ fn header(p: &Paper) -> String {
 
 /// Items found in one paper (header line with id/title, then items).
 /// Item text is truncated to 3x `abslen` chars unless --full.
-pub fn items(p: &Paper, it: &[Item], f: &Fmt) -> String {
+pub fn items<'a>(p: &Paper, it: impl IntoIterator<Item = &'a Item>, f: &Fmt) -> String {
     let mut s = header(p);
-    if it.is_empty() {
-        s.push_str("\n0 items");
-        return s;
-    }
     let max = f.abslen().saturating_mul(3);
+    let mut text = String::new();
+    let mut any = false;
     for i in it {
+        any = true;
         s.push_str("\n[");
         s.push_str(i.kind.code());
         if !i.label.is_empty() {
             s.push(' ');
-            s.push_str(&collapse(&i.label));
+            push_collapsed(&mut s, &i.label);
         }
         if !i.sec.is_empty() {
             s.push_str(" § ");
             s.push_str(&i.sec);
         }
         s.push_str("] ");
-        s.push_str(&trunc(&collapse(&i.text), max));
+        text.clear();
+        push_collapsed(&mut text, &i.text);
+        s.push_str(&trunc_cow(&text, max));
+    }
+    if !any {
+        s.push_str("\n0 items");
     }
     s
 }
@@ -1065,17 +1065,19 @@ pub fn outline(p: &Paper, secs: &[Section]) -> String {
         }
         s.push_str(&x.id);
         s.push(' ');
-        s.push_str(&collapse(&x.title));
+        push_collapsed(&mut s, &x.title);
     }
     s
 }
 
 pub fn hits(p: &Paper, h: &[Hit]) -> String {
+    use std::fmt::Write;
     let mut s = header(p);
     if h.is_empty() {
         s.push_str("\n0 hits");
         return s;
     }
+    let mut sn = String::new();
     for x in h {
         s.push('\n');
         if !x.sec.is_empty() {
@@ -1083,8 +1085,9 @@ pub fn hits(p: &Paper, h: &[Hit]) -> String {
             s.push_str(&x.sec);
             s.push(' ');
         }
-        s.push_str(&format!("@{}: ", x.pos));
-        let sn = collapse(&x.snippet);
+        let _ = write!(s, "@{}: ", x.pos);
+        sn.clear();
+        push_collapsed(&mut sn, &x.snippet);
         if !sn.starts_with('…') {
             s.push('…');
         }
@@ -1097,23 +1100,31 @@ pub fn hits(p: &Paper, h: &[Hit]) -> String {
 }
 
 /// `[n] text (arXiv:id) (doi:..)`; text truncated to 160 chars unless --full.
-pub fn refs(p: &Paper, r: &[Ref], f: &Fmt) -> String {
+pub fn refs<'a>(p: &Paper, r: impl IntoIterator<Item = &'a Ref>, f: &Fmt) -> String {
+    use std::fmt::Write;
     let max = if f.full() { usize::MAX } else { 160 };
     let mut s = header(p);
-    if r.is_empty() {
-        s.push_str("\n0 refs");
-        return s;
-    }
+    let mut text = String::new();
+    let mut any = false;
     for x in r {
-        let text = collapse(&x.text);
-        let shown = trunc(&text, max);
-        s.push_str(&format!("\n[{}] {}", x.n, shown));
-        if let Some(a) = x.arxiv.as_deref().filter(|a| !shown.contains(a)) {
-            s.push_str(&format!(" (arXiv:{a})"));
+        any = true;
+        text.clear();
+        push_collapsed(&mut text, &x.text);
+        let _ = write!(s, "\n[{}] ", x.n);
+        let from = s.len();
+        s.push_str(&trunc_cow(&text, max));
+        let shown = &s[from..];
+        let arxiv = x.arxiv.as_deref().filter(|a| !shown.contains(a));
+        let doi = x.doi.as_deref().filter(|d| !shown.contains(d));
+        if let Some(a) = arxiv {
+            let _ = write!(s, " (arXiv:{a})");
         }
-        if let Some(d) = x.doi.as_deref().filter(|d| !shown.contains(d)) {
-            s.push_str(&format!(" (doi:{d})"));
+        if let Some(d) = doi {
+            let _ = write!(s, " (doi:{d})");
         }
+    }
+    if !any {
+        s.push_str("\n0 refs");
     }
     s
 }
@@ -1596,6 +1607,18 @@ mod tests {
     }
 
     #[test]
+    fn est_tokens_counts_ascii_chars_and_wide_chars() {
+        let reference = |s: &str| {
+            let (a, o) = s.chars().fold((0, 0), |(a, o), c| if c.is_ascii() { (a + 1, o) } else { (a, o + 1) });
+            (a * 5 + 17) / 18 + o
+        };
+        assert_eq!(est_tokens("h\u{e9}llo"), 3);
+        for s in ["", "abc", &"\u{e9}".repeat(700), &"ab \u{e9}\u{4e16} ".repeat(300), &"x".repeat(255), &"x".repeat(256), &format!("{}\u{1f600}", "y".repeat(254))] {
+            assert_eq!(est_tokens(s), reference(s), "{} bytes", s.len());
+        }
+    }
+
+    #[test]
     fn tok_budget_renders_only_what_it_keeps() {
         let ps: Vec<Paper> = (0..50).map(|i| paper(&format!("2301.{i:05}"), "A fairly long title for this paper", &["Terence Tao"], &["math.NT"], "2023-01-03T10:00:00Z")).collect();
         let all = papers(&ps, None, &fmt(&[], "id,a,t"));
@@ -1604,5 +1627,14 @@ mod tests {
         assert!(lines.len() < 50 && lines.last().unwrap().ends_with("budget)"), "{few}");
         assert!(all.starts_with(&few[..few.rfind('\n').unwrap()]));
         assert!(few.contains(&format!("(showing {} of 50, budget)", lines.len() - 1)));
+    }
+
+    #[test]
+    fn clip_cuts_long_text_without_counting_it_twice() {
+        let text = format!("T\n{}", "word ".repeat(2000));
+        let clipped = clip(text.clone(), 100);
+        assert!(clipped.ends_with("tok]"), "{clipped}");
+        assert!(clipped.len() < 600, "{}", clipped.len());
+        assert_eq!(clip("short".into(), 100), "short");
     }
 }

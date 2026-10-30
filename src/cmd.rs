@@ -8,6 +8,7 @@ use crate::filter::Filter;
 use crate::model::*;
 use crate::net::{Net, Ttl};
 use crate::out::{self, Fmt};
+use crate::html::Want;
 use crate::{html, query, tags, taxonomy, tex, venue};
 
 /// Alert cursor update: (watch name, (cursor date, seen ids), (query, last date) snapshot it was computed from).
@@ -289,11 +290,15 @@ pub struct DocData {
     pub is_tex: bool,
 }
 
-async fn load_html(net: &Net, id: &str) -> Result<Option<DocData>, String> {
+fn parse_doc(h: &str, want: Want) -> DocData {
+    let d = html::parse_for(h, want);
+    DocData { title: d.title, text: d.md, sections: d.sections, items: d.items, refs: d.refs, is_tex: false }
+}
+
+async fn load_html(net: &Net, id: &str, want: Want) -> Result<Option<DocData>, String> {
     for base in ["https://arxiv.org/html/", "https://ar5iv.labs.arxiv.org/html/"] {
         if let Some(h) = net.get_text(&format!("{base}{id}"), Ttl::Doc).await? {
-            let d = html::parse(&h);
-            return Ok(Some(DocData { title: d.title, text: d.md, sections: d.sections, items: d.items, refs: d.refs, is_tex: false }));
+            return Ok(Some(parse_doc(&h, want)));
         }
     }
     Ok(None)
@@ -310,26 +315,34 @@ async fn load_tex(net: &Net, id: &str) -> Result<Option<DocData>, String> {
 /// `--src html` (default: arxiv.org/html, then ar5iv for older papers) or `--src tex`. The e-print source
 /// is opt-in only: arXiv's robots.txt asks automated agents not to fetch /e-print, so it is used solely
 /// when explicitly requested for a paper, never as a silent fallback.
-pub async fn load_doc(net: &Net, id: &str, a: &Args) -> Result<DocData, String> {
+pub async fn load_doc(net: &Net, id: &str, a: &Args, want: Want) -> Result<DocData, String> {
     if a.get("src") == Some("tex") {
         net.note("TeX source fetched from arxiv.org/e-print on request (robots.txt discourages bulk automated use; cached afterwards)");
         return load_tex(net, id).await?.ok_or_else(|| format!("{id}: no TeX source available"));
     }
-    load_html(net, id).await?.ok_or_else(|| format!("{id}: no HTML version (older paper?); `--src tex` fetches the TeX source instead"))
+    load_html(net, id, want).await?.ok_or_else(|| format!("{id}: no HTML version (older paper?); `--src tex` fetches the TeX source instead"))
 }
 
 /// Run `f` over every id concurrently; results in input order, errors inlined as text.
-async fn per_doc<F>(net: &Net, a: &Args, ids: Vec<String>, f: F) -> (String, usize)
+async fn per_doc<F>(net: &Net, a: &Args, ids: Vec<String>, want: Want, f: F) -> (String, usize)
 where
-    F: Fn(&str, DocData) -> String,
+    F: Fn(&str, &DocData) -> String,
 {
-    let futs = ids.iter().map(|id| async move { (id, load_doc(net, id, a).await) });
+    let futs = ids.iter().map(|id| async move { (id, load_doc(net, id, a, want).await) });
+    gather(join_all(futs).await, f)
+}
+
+fn gather<F>(docs: Vec<(&String, Result<DocData, String>)>, f: F) -> (String, usize)
+where
+    F: Fn(&str, &DocData) -> String,
+{
     let mut s = String::new();
     let mut failed = 0;
-    for (id, r) in join_all(futs).await {
+    for (id, r) in docs {
         let part = match r {
             Ok(d) => {
-                let p = f(id, d);
+                let p = f(id, &d);
+                drop(d);
                 // callbacks report a per-document problem as "<id>: error: ..." (e.g. a missing section)
                 if p.starts_with(&format!("{id}: error:")) {
                     failed += 1;
@@ -342,13 +355,18 @@ where
             }
         };
         if !part.is_empty() {
-            s.push_str(&part);
-            if !part.ends_with('\n') {
+            if s.is_empty() {
+                s = part;
+            } else {
+                s.push_str(&part);
+            }
+            if !s.ends_with('\n') {
                 s.push('\n');
             }
         }
     }
-    (s.trim_end().to_string(), failed)
+    s.truncate(s.trim_end().len());
+    (s, failed)
 }
 
 /// Ids for content commands: piped papers or explicit ids; a text query triggers a search.
@@ -394,17 +412,44 @@ fn parse_kinds(spec: Option<&str>) -> Result<Vec<Kind>, String> {
     Ok(v)
 }
 
-fn render_items(id: &str, d: &DocData, kinds: &[Kind], a: &Args, f: &Fmt, meta: Option<&Paper>, show_empty: bool) -> String {
+/// `hay` contains `needle` (already ASCII-lowercased) ignoring ASCII case.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    // the scan below is O(hay x needle) in the worst case; long needles use the linear std search
+    if needle.len() > 32 {
+        return hay.to_ascii_lowercase().contains(needle);
+    }
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    let Some(&first) = n.first() else { return true };
+    let (lo, up) = (first.to_ascii_lowercase(), first.to_ascii_uppercase());
+    let mut i = 0;
+    while i + n.len() <= h.len() {
+        match h[i..=h.len() - n.len()].iter().position(|&c| c == lo || c == up) {
+            None => return false,
+            Some(o) => {
+                i += o;
+                if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+    }
+    false
+}
+
+pub(crate) fn render_items(id: &str, d: &DocData, kinds: &[Kind], a: &Args, f: &Fmt, meta: Option<&Paper>, show_empty: bool) -> String {
     let pat = a.get("pat").map(str::to_ascii_lowercase);
     let max = a.num::<usize>("max").unwrap_or(usize::MAX);
-    let items: Vec<Item> = d
+    let mut items = d
         .items
         .iter()
         .filter(|i| kinds.contains(&i.kind))
-        .filter(|i| pat.as_ref().map_or(true, |p| i.text.to_ascii_lowercase().contains(p.as_str())))
+        .filter(|i| pat.as_ref().map_or(true, |p| contains_ci(&i.text, p)))
         .take(max)
-        .cloned()
-        .collect();
+        .peekable();
+    if items.peek().is_none() {
+        return if show_empty { format!("{id} 0 items") } else { String::new() };
+    }
     let stub;
     let p = match meta {
         Some(p) => p,
@@ -413,10 +458,7 @@ fn render_items(id: &str, d: &DocData, kinds: &[Kind], a: &Args, f: &Fmt, meta: 
             &stub
         }
     };
-    if items.is_empty() {
-        return if show_empty { format!("{id} 0 items") } else { String::new() };
-    }
-    out::items(p, &items, f)
+    out::items(p, items, f)
 }
 
 pub async fn problems(net: &Net, a: &Args, input: Input) -> Res {
@@ -427,9 +469,9 @@ pub async fn problems(net: &Net, a: &Args, input: Input) -> Res {
         return Ok(Out::text("0 results"));
     }
     let metas: std::collections::HashMap<&str, &Paper> = papers.iter().map(|p| (p.id.as_str(), p)).collect();
-    let (text, failed) = per_doc(net, a, ids, |id, d| {
+    let (text, failed) = per_doc(net, a, ids, Want::Items, |id, d| {
         let m = metas.get(id).copied().filter(|p| !p.title.is_empty());
-        render_items(id, &d, &kinds, a, &f, m, true)
+        render_items(id, d, &kinds, a, &f, m, true)
     })
     .await;
     Ok(Out { papers, text: clip_opt(a, text), failed, ..Default::default() })
@@ -438,6 +480,37 @@ pub async fn problems(net: &Net, a: &Args, input: Input) -> Res {
 // ---------------------------------------------------------------- text / outline / sec / grep / refs
 
 const DEFAULT_TEXT_TOK: usize = 6000;
+
+/// One document's `text` / `sec` output (before the shared token clip).
+fn render_text(id: &str, d: &DocData, sec: Option<&str>, skip: usize, raw: bool) -> String {
+    let region: &str = match sec {
+        Some(k) => match html::find_section(&d.sections, k) {
+            Some(s) => d.text.get(s.start..s.end).unwrap_or(""),
+            None => return format!("{id}: error: no section {k:?} (see `arx outline {id}`)"),
+        },
+        // TeX: skip the preamble, the typeset body starts at \begin{document} (--raw: whole source)
+        None if d.is_tex && !raw => tex::body(&d.text),
+        None => &d.text,
+    };
+    let cleaned;
+    let body: &str = if d.is_tex && !raw {
+        cleaned = tex::clean(region);
+        &cleaned
+    } else {
+        region
+    };
+    let start = body.char_indices().nth(skip).map_or(body.len(), |(i, _)| i);
+    let body = &body[start..];
+    let mut out = String::with_capacity(id.len() + d.title.len() + 2 + body.len());
+    out.push_str(id);
+    if !d.title.is_empty() {
+        out.push(' ');
+        out.push_str(&d.title);
+    }
+    out.push('\n');
+    out.push_str(body);
+    out
+}
 
 pub async fn text(net: &Net, a: &Args, input: Input) -> Res {
     // --skip is a character offset here, not a paper offset
@@ -448,34 +521,31 @@ pub async fn text(net: &Net, a: &Args, input: Input) -> Res {
     let tok = a.num::<usize>("tok").unwrap_or(DEFAULT_TEXT_TOK);
     let skip = a.num::<usize>("skip").unwrap_or(0);
     let raw = a.flag("raw");
-    let (s, failed) = per_doc(net, a, ids, |id, d| {
-        let region: &str = match &sec {
-            Some(k) => match html::find_section(&d.sections, k) {
-                Some(s) => d.text.get(s.start..s.end).unwrap_or(""),
-                None => return format!("{id}: error: no section {k:?} (see `arx outline {id}`)"),
-            },
-            // TeX: skip the preamble, the typeset body starts at \begin{document} (--raw: whole source)
-            None if d.is_tex && !raw => tex::body(&d.text),
-            None => &d.text,
-        };
-        let cleaned;
-        let body: &str = if d.is_tex && !raw {
-            cleaned = tex::clean(region);
-            &cleaned
-        } else {
-            region
-        };
-        let start = body.char_indices().nth(skip).map_or(body.len(), |(i, _)| i);
-        format!("{id}{}\n{}", if d.title.is_empty() { String::new() } else { format!(" {}", d.title) }, &body[start..])
-    })
-    .await;
+    let (s, failed) = per_doc(net, a, ids, Want::Text, |id, d| render_text(id, d, sec.as_deref(), skip, raw)).await;
     Ok(Out { papers, text: out::clip(s, tok), failed, ..Default::default() })
 }
 
 pub async fn outline(net: &Net, a: &Args, input: Input) -> Res {
     let (papers, ids) = content_ids(net, a, input).await?;
-    let (s, failed) = per_doc(net, a, ids, |id, d| out::outline(&stub_paper(id, &d.title), &d.sections)).await;
+    let (s, failed) = per_doc(net, a, ids, Want::Outline, |id, d| out::outline(&stub_paper(id, &d.title), &d.sections)).await;
     Ok(Out { papers, text: clip_opt(a, s), failed, ..Default::default() })
+}
+
+/// One document's `grep` output ("" when nothing matched).
+fn render_grep(id: &str, d: &DocData, pat: &str, ctx: usize, max: usize) -> String {
+    // raw TeX is searched as the cleaned typeset text (no preamble, no `\%` escapes); no section labels there
+    let cleaned;
+    let (text, secs): (&str, &[Section]) = if d.is_tex {
+        cleaned = tex::clean(tex::body(&d.text));
+        (&cleaned, &[])
+    } else {
+        (&d.text, &d.sections)
+    };
+    let hits = html::grep(text, secs, pat, ctx, max);
+    if hits.is_empty() {
+        return String::new();
+    }
+    out::hits(&stub_paper(id, &d.title), &hits)
 }
 
 pub async fn grep(net: &Net, a: &Args, input: Input) -> Res {
@@ -498,24 +568,15 @@ pub async fn grep(net: &Net, a: &Args, input: Input) -> Res {
     let ctx = a.num::<usize>("ctx").unwrap_or(120);
     let max = a.num::<usize>("max").unwrap_or(5);
     let (papers, ids) = content_ids(net, &a, input).await?;
-    let (s, failed) = per_doc(net, &a, ids, |id, d| {
-        // raw TeX is searched as the cleaned typeset text (no preamble, no `\%` escapes); no section labels there
-        let cleaned;
-        let (text, secs): (&str, &[Section]) = if d.is_tex {
-            cleaned = tex::clean(tex::body(&d.text));
-            (&cleaned, &[])
-        } else {
-            (&d.text, &d.sections)
-        };
-        let hits = html::grep(text, secs, &pat, ctx, max);
-        if hits.is_empty() {
-            return String::new();
-        }
-        out::hits(&stub_paper(id, &d.title), &hits)
-    })
-    .await;
+    let (s, failed) = per_doc(net, &a, ids, Want::Text, |id, d| render_grep(id, d, &pat, ctx, max)).await;
     let s = if s.is_empty() { "0 hits".to_string() } else { s };
     Ok(Out { papers, text: clip_opt(&a, s), failed, ..Default::default() })
+}
+
+/// One document's `refs` output; `pat` is already ASCII-lowercased.
+fn render_refs(id: &str, d: &DocData, pat: Option<&str>, max: usize, f: &Fmt) -> String {
+    let r = d.refs.iter().filter(|r| pat.map_or(true, |p| contains_ci(&r.text, p))).take(max);
+    out::refs(&stub_paper(id, &d.title), r, f)
 }
 
 pub async fn refs(net: &Net, a: &Args, input: Input) -> Res {
@@ -523,17 +584,7 @@ pub async fn refs(net: &Net, a: &Args, input: Input) -> Res {
     let f = Fmt::from_args(a, "id")?;
     let pat = a.get("pat").map(str::to_ascii_lowercase);
     let max = a.num::<usize>("max").unwrap_or(usize::MAX);
-    let (s, failed) = per_doc(net, a, ids, |id, d| {
-        let r: Vec<Ref> = d
-            .refs
-            .iter()
-            .filter(|r| pat.as_ref().map_or(true, |p| r.text.to_ascii_lowercase().contains(p.as_str())))
-            .take(max)
-            .cloned()
-            .collect();
-        out::refs(&stub_paper(id, &d.title), &r, &f)
-    })
-    .await;
+    let (s, failed) = per_doc(net, a, ids, Want::Refs, |id, d| render_refs(id, d, pat.as_deref(), max, &f)).await;
     Ok(Out { papers, text: clip_opt(a, s), failed, ..Default::default() })
 }
 
@@ -746,5 +797,19 @@ mod tests {
         assert_eq!(parse_kinds(Some("thm,lem")).unwrap(), [Kind::Theorem, Kind::Lemma]);
         assert_eq!(parse_kinds(Some("all")).unwrap().len(), 13);
         assert!(parse_kinds(Some("zzz")).unwrap_err().contains("prob"));
+    }
+
+    #[test]
+    fn contains_ci_ignores_ascii_case_only() {
+        assert!(contains_ci("Hello World", "lo wo"));
+        assert!(contains_ci("x", ""));
+        assert!(contains_ci("Attention Is All You Need", "all you"));
+        assert!(!contains_ci("abc", "abd"));
+        let long = "a".repeat(40);
+        assert!(contains_ci(&format!("x{}Y", long.to_ascii_uppercase()), &long));
+        assert!(!contains_ci(&"a".repeat(1000), &format!("{long}b")));
+        assert!(!contains_ci("ab", "abc"));
+        assert!(!contains_ci("\u{c9}a", "\u{e9}a"));
+        assert!(contains_ci("\u{e9}A", "\u{e9}a"));
     }
 }
