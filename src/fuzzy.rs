@@ -1,6 +1,8 @@
 //! Accent-insensitive fuzzy matching: normalisation, Jaro-Winkler, edit-distance ratio,
 //! token-window containment and author-name matching.
 
+use std::borrow::Cow;
+
 /// Replacement for a lowercase non-ASCII Latin letter (diacritics stripped, common transliterations).
 fn latin(c: char) -> Option<&'static str> {
     Some(match c {
@@ -57,7 +59,11 @@ pub fn fold(s: &str) -> String {
     for c in s.chars() {
         if c.is_ascii() {
             if c.is_ascii_alphanumeric() {
-                put(&mut out, &mut gap, c.to_ascii_lowercase().encode_utf8(&mut buf));
+                if gap && !out.is_empty() {
+                    out.push(' ');
+                }
+                gap = false;
+                out.push(c.to_ascii_lowercase());
             } else if c != '\'' && c != '`' {
                 gap = true;
             }
@@ -327,7 +333,10 @@ struct Name {
     core: Vec<String>,
 }
 
-fn strip_brackets(s: &str) -> String {
+fn strip_brackets(s: &str) -> Cow<'_, str> {
+    if !s.contains(['(', '[', ')', ']']) {
+        return Cow::Borrowed(s);
+    }
     let mut out = String::with_capacity(s.len());
     let mut depth = 0u32;
     for c in s.chars() {
@@ -338,15 +347,78 @@ fn strip_brackets(s: &str) -> String {
             _ => {}
         }
     }
-    out
+    Cow::Owned(out)
 }
 
-fn fold_split(s: &str) -> impl Iterator<Item = String> {
-    fold(s).split(' ').filter(|t| !t.is_empty()).map(str::to_string).collect::<Vec<_>>().into_iter()
+/// Folded tokens of `s`.
+fn fold_split(s: &str) -> Vec<String> {
+    let f = fold(s);
+    if !f.contains(' ') {
+        return if f.is_empty() { Vec::new() } else { vec![f] };
+    }
+    f.split(' ').filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
+/// Push the folded tokens of `s` onto `out`.
+fn push_folded(s: &str, out: &mut Vec<String>) {
+    let f = fold(s);
+    if !f.contains(' ') {
+        if !f.is_empty() {
+            out.push(f);
+        }
+    } else {
+        out.extend(f.split(' ').filter(|t| !t.is_empty()).map(str::to_string));
+    }
+}
+
+/// `fold(t)` when it is short enough to equal one of the (space-free, <= 5 letter) words the callers
+/// compare against: `Ok(Some(folded))`, `Ok(None)` when an ASCII `t` cannot equal any of them. `Err` for
+/// non-ASCII text, which needs the full `fold`.
+fn small_fold<'a>(t: &str, buf: &'a mut [u8; 5]) -> Result<Option<&'a str>, ()> {
+    if !t.is_ascii() {
+        return Err(());
+    }
+    let (mut n, mut gap) = (0, false);
+    for &c in t.as_bytes() {
+        if c.is_ascii_alphanumeric() {
+            if (gap && n > 0) || n == buf.len() {
+                return Ok(None);
+            }
+            buf[n] = c.to_ascii_lowercase();
+            n += 1;
+            gap = false;
+        } else if c != b'\'' && c != b'`' {
+            gap = true;
+        }
+    }
+    Ok(Some(std::str::from_utf8(&buf[..n]).unwrap_or("")))
+}
+
+fn is_suffix_tok(t: &str) -> bool {
+    let mut buf = [0u8; 5];
+    match small_fold(t, &mut buf) {
+        Ok(f) => f.is_some_and(is_suffix),
+        Err(()) => is_suffix(&fold(t)),
+    }
+}
+
+fn is_suffix(f: &str) -> bool {
+    matches!(f, "jr" | "sr" | "ii" | "iii" | "iv")
+}
+
+fn is_particle_tok(t: &str) -> bool {
+    let mut buf = [0u8; 5];
+    match small_fold(t, &mut buf) {
+        Ok(f) => f.is_some_and(is_particle),
+        Err(()) => is_particle(&fold(t)),
+    }
 }
 
 fn core_of(raw: &str) -> Vec<String> {
-    let all: Vec<String> = fold_split(raw).collect();
+    let all = fold_split(raw);
+    if all.len() <= 1 {
+        return all;
+    }
     let core: Vec<String> = all.iter().filter(|t| !is_particle(t)).cloned().collect();
     if core.is_empty() {
         all
@@ -369,18 +441,19 @@ fn push_given(raw: &str, expand_caps: bool, out: &mut Vec<String>) {
         out.extend(raw.chars().map(|c| c.to_ascii_lowercase().to_string()));
     } else if raw.ends_with('.') && raw.chars().filter(|c| c.is_alphabetic()).count() == 2 && !raw.contains('-') {
         // transliterated initial ("Yu.", "Ph."): keep the dot so it matches any name starting with it
-        out.extend(fold_split(raw).map(|t| format!("{t}.")));
+        out.extend(fold_split(raw).into_iter().map(|t| format!("{t}.")));
     } else {
-        out.extend(fold_split(raw));
+        push_folded(raw, out);
     }
 }
 
 fn parse_name(raw: &str) -> Name {
-    let mut clean = strip_brackets(raw);
+    let stripped = strip_brackets(raw);
     // "John Smith, Jr." / "Smith, John, Jr.": drop trailing generational suffixes before detecting name order
+    let mut clean: &str = &stripped;
     while let Some((head, tail)) = clean.rsplit_once(',') {
-        if matches!(fold(tail).as_str(), "jr" | "sr" | "ii" | "iii" | "iv") {
-            clean = head.to_string();
+        if is_suffix_tok(tail) {
+            clean = head;
         } else {
             break;
         }
@@ -397,7 +470,7 @@ fn parse_name(raw: &str) -> Name {
         return n;
     }
     let mut toks: Vec<&str> = clean.split_whitespace().collect();
-    while toks.len() > 1 && matches!(fold(toks[toks.len() - 1]).as_str(), "jr" | "sr" | "ii" | "iii" | "iv") {
+    while toks.len() > 1 && is_suffix_tok(toks[toks.len() - 1]) {
         toks.pop();
     }
     // "Smirnov A. Yu.": one full word followed only by dotted initials is written surname-first
@@ -410,7 +483,7 @@ fn parse_name(raw: &str) -> Name {
     }
     let Some(last) = toks.pop() else { return n };
     n.core = core_of(last);
-    while toks.last().is_some_and(|t| is_particle(&fold(t)) || t.starts_with(['\'', '\u{2019}'])) {
+    while toks.last().is_some_and(|t| is_particle_tok(t) || t.starts_with(['\'', '\u{2019}'])) {
         toks.pop();
     }
     let caps = !last.bytes().all(|b| b.is_ascii_uppercase() || !b.is_ascii_alphabetic());
@@ -439,7 +512,14 @@ fn surname_sim(a: &str, b: &str) -> f32 {
         return 1.0;
     }
     let j = jw(a, b);
-    if a.chars().count().max(b.chars().count()) <= 4 || ratio(a, b) < 0.75 {
+    // below the cap both outcomes are `j`: skip the edit distance
+    if j <= 0.6 {
+        return j;
+    }
+    let (la, lb) = (a.chars().count(), b.chars().count());
+    // the edit distance is at least the length difference: if that alone puts the ratio under 0.75, so does the distance
+    let (ml, d) = (la.min(MAXC).max(lb.min(MAXC)), la.min(MAXC).abs_diff(lb.min(MAXC)));
+    if la.max(lb) <= 4 || 1.0 - (d as f32 / ml as f32) < 0.75 || ratio(a, b) < 0.75 {
         j.min(0.6)
     } else {
         j
@@ -536,18 +616,59 @@ fn direct(q: &Name, a: &Name) -> f32 {
 
 const COLLAB_WORDS: &[&str] = &["collaboration", "collaborations", "consortium", "experiment", "working", "team", "project"];
 
-/// Some(score) when `author` is a collaboration: every query token must appear among its words.
-fn collab_score(q: &Name, author: &str) -> Option<f32> {
-    let words: Vec<String> = fold_split(&strip_brackets(author)).collect();
-    if !words.iter().any(|w| COLLAB_WORDS.contains(&w.as_str())) {
-        return None;
+/// Does the folded author (brackets removed) contain a collaboration word? ASCII names are checked without
+/// building the folded string.
+fn has_collab_word(raw: &str) -> bool {
+    let s = strip_brackets(raw);
+    if !s.is_ascii() {
+        return fold(&s).split(' ').any(|w| COLLAB_WORDS.contains(&w));
     }
-    let qt: Vec<&String> = q.given.iter().chain(q.core.iter()).collect();
-    if qt.is_empty() {
-        return Some(0.0);
+    let (mut buf, mut n) = ([0u8; 16], 0usize);
+    // a word ends at any non-alphanumeric byte other than ' and `, which fold drops without splitting
+    for &c in s.as_bytes().iter().chain(std::iter::once(&b' ')) {
+        if c.is_ascii_alphanumeric() {
+            if n < buf.len() {
+                buf[n] = c.to_ascii_lowercase();
+            }
+            n += 1;
+        } else if c != b'\'' && c != b'`' {
+            if n <= buf.len() && COLLAB_WORDS.iter().any(|w| w.as_bytes() == &buf[..n]) {
+                return true;
+            }
+            n = 0;
+        }
     }
-    let all = qt.iter().all(|t| words.iter().any(|w| surname_sim(t, w) >= SURNAME_GATE));
-    Some(if all { 0.95 } else { 0.0 })
+    false
+}
+
+/// One paper author, with the query-independent parts of matching (folded words, parsed name, swapped
+/// reading) computed at most once however many queries are scored against it.
+pub struct AuthorView<'a> {
+    raw: &'a str,
+    collab: Option<bool>,
+    folded: Option<String>,
+    name: Option<Name>,
+    swapped: Option<Option<Name>>,
+}
+
+impl<'a> AuthorView<'a> {
+    pub fn new(raw: &'a str) -> Self {
+        AuthorView { raw, collab: None, folded: None, name: None, swapped: None }
+    }
+}
+
+/// Score against a collaboration (`folded` has a collaboration word): every query token must appear among its words.
+fn collab_score(q: &Name, folded: &str) -> f32 {
+    let words = || folded.split(' ').filter(|w| !w.is_empty());
+    let mut qt = q.given.iter().chain(q.core.iter()).peekable();
+    if qt.peek().is_none() {
+        return 0.0;
+    }
+    if qt.all(|t| words().any(|w| surname_sim(t, w) >= SURNAME_GATE)) {
+        0.95
+    } else {
+        0.0
+    }
 }
 
 /// Author-name query ("Terence Tao", "Tao, T.", "van der Waerden", "Erdős").
@@ -559,29 +680,37 @@ pub struct AuthorQ {
 impl AuthorQ {
     pub fn new(q: &str) -> AuthorQ {
         let name = parse_name(q);
-        let folded: Vec<String> = fold_split(&strip_brackets(q)).collect();
+        let folded = fold_split(&strip_brackets(q));
         let compound = (!q.contains(',') && folded.len() >= 2 && folded.iter().all(|t| t.chars().count() >= 2))
             .then(|| Name { given: Vec::new(), core: folded });
         AuthorQ { name, compound }
     }
     /// 0..1: how well a paper author string matches the query name.
+    #[cfg(test)]
     pub fn score(&self, author: &str) -> f32 {
+        self.score_view(&mut AuthorView::new(author))
+    }
+    /// Like `score`, reusing what `author` already computed for other queries.
+    pub fn score_view(&self, v: &mut AuthorView) -> f32 {
         if self.name.core.is_empty() {
             return 0.0;
         }
+        let raw = v.raw;
         // collaborations ("The ATLAS Collaboration"): match organisation words, not a personal surname
-        if let Some(c) = collab_score(&self.name, author) {
-            return c;
+        if *v.collab.get_or_insert_with(|| has_collab_word(raw)) {
+            let folded = v.folded.get_or_insert_with(|| fold(&strip_brackets(raw)));
+            return collab_score(&self.name, folded);
         }
-        let a = parse_name(author);
-        let s = direct(&self.name, &a);
+        let a = v.name.get_or_insert_with(|| parse_name(raw));
+        let s = direct(&self.name, a);
         let s = match &self.compound {
             // only against authors whose own surname is as long: "Terence Tao" must not read as the
             // compound surname "Terence Tao" and then match "Sarah Tao"
-            Some(c) if a.core.len() >= c.core.len() => s.max(direct(c, &a)),
+            Some(c) if a.core.len() >= c.core.len() => s.max(direct(c, a)),
             // spaced compound surname written in full ("María Ángeles García Ferrero"): trailing name tokens
             Some(c) => {
-                let at: Vec<String> = fold_split(&strip_brackets(author)).collect();
+                let folded = v.folded.get_or_insert_with(|| fold(&strip_brackets(raw)));
+                let at: Vec<&str> = folded.split(' ').filter(|t| !t.is_empty()).collect();
                 let k = c.core.len();
                 if at.len() >= k && at[at.len() - k..].iter().zip(&c.core).all(|(x, y)| surname_sim(x, y) >= SURNAME_GATE) {
                     s.max(0.92)
@@ -592,8 +721,8 @@ impl AuthorQ {
             _ => s,
         };
         if s < 0.5 && !self.name.given.is_empty() {
-            if let Some(sw) = swapped_name(author) {
-                return s.max(0.92 * direct(&self.name, &sw));
+            if let Some(sw) = v.swapped.get_or_insert_with(|| swapped_name(raw)) {
+                return s.max(0.92 * direct(&self.name, sw));
             }
         }
         s
@@ -919,5 +1048,25 @@ mod inst_regress {
     fn initial_in_haystack_is_not_a_match() {
         assert!(contains_fuzzy_strict("Qiuzhen College, Tsinghua University, Beijing, P. R. China", "princeton") < 0.5);
         assert!(contains_fuzzy_strict("Department of Mathematics, Princeton University, NJ", "princeton") > 0.99);
+    }
+
+    #[test]
+    fn reused_author_views_score_like_fresh_ones() {
+        let authors = ["Terence Tao", "Tao, T.", "The ATLAS Collaboration", "Foo (Collaboration)", "María García Ferrero", "Smith, John, Jr.", "O'Brien", ""];
+        let queries: Vec<AuthorQ> = ["tao", "Terence Tao", "Garcia Ferrero", "ATLAS", "John Smith"].iter().map(|q| AuthorQ::new(q)).collect();
+        for a in authors {
+            let mut v = AuthorView::new(a);
+            for q in &queries {
+                assert_eq!(q.score_view(&mut v).to_bits(), q.score(a).to_bits(), "{a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn collab_words_are_found_like_in_the_folded_name() {
+        for (a, want) in [("The ATLAS Collaboration", true), ("Foo (Collaboration)", false), ("Collab'oration", true), ("Coll`aboration", true), ("My-Team", true), ("Teams", false), ("Ünï Project", true), ("collaborationsXY", false), ("", false)] {
+            assert_eq!(has_collab_word(a), fold(&strip_brackets(a)).split(' ').any(|w| COLLAB_WORDS.contains(&w)), "{a:?}");
+            assert_eq!(has_collab_word(a), want, "{a:?}");
+        }
     }
 }

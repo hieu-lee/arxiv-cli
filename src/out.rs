@@ -8,7 +8,9 @@
 
 use crate::args::Args;
 use crate::model::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
@@ -163,7 +165,26 @@ impl Fmt {
 
 // ---------------------------------------------------------------- text helpers
 
-fn collapse(s: &str) -> String {
+/// Whitespace-normalised `s`; borrowed when it already is (the common case for parsed metadata).
+fn collapse(s: &str) -> Cow<'_, str> {
+    let mut prev_ws = true;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            if c != ' ' || prev_ws {
+                return Cow::Owned(collapse_owned(s));
+            }
+            prev_ws = true;
+        } else {
+            prev_ws = false;
+        }
+    }
+    if prev_ws && !s.is_empty() {
+        return Cow::Owned(collapse_owned(s));
+    }
+    Cow::Borrowed(s)
+}
+
+fn collapse_owned(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for w in s.split_whitespace() {
         if !out.is_empty() {
@@ -174,14 +195,35 @@ fn collapse(s: &str) -> String {
     out
 }
 
+/// `collapse` for a string that is already owned: reuses it when nothing changes.
+fn collapse_string(s: String) -> String {
+    let changed = match collapse(&s) {
+        Cow::Owned(o) => Some(o),
+        Cow::Borrowed(_) => None,
+    };
+    changed.unwrap_or(s)
+}
+
+/// `trunc(&collapse(s), max)` without copying when nothing changes.
+fn collapse_trunc(s: &str, max: usize) -> Cow<'_, str> {
+    match collapse(s) {
+        Cow::Borrowed(b) => trunc_cow(b, max),
+        Cow::Owned(o) => Cow::Owned(trunc(&o, max)),
+    }
+}
+
 /// Truncate to at most `max` chars including the trailing `…`, at a word boundary when possible.
 /// Never splits a char. Strings of <= `max` chars are returned unchanged.
 pub fn trunc(s: &str, max: usize) -> String {
+    trunc_cow(s, max).into_owned()
+}
+
+fn trunc_cow(s: &str, max: usize) -> Cow<'_, str> {
     let Some((cut, _)) = s.char_indices().nth(max) else {
-        return s.to_string();
+        return Cow::Borrowed(s);
     };
     if max == 0 {
-        return String::new();
+        return Cow::Borrowed("");
     }
     let (idx, _) = s.char_indices().nth(max - 1).unwrap_or((cut, ' '));
     let head = &s[..idx];
@@ -194,52 +236,68 @@ pub fn trunc(s: &str, max: usize) -> String {
         }
     };
     let word_end = word_end.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-'));
-    format!("{word_end}…")
+    Cow::Owned(format!("{word_end}…"))
+}
+
+/// Append `s` as a JSON string literal (with quotes). Non-ASCII passes through; control chars are escaped.
+fn json_push(o: &mut String, s: &str) {
+    o.reserve(s.len() + 2);
+    o.push('"');
+    let mut plain = 0;
+    for (i, &b) in s.as_bytes().iter().enumerate() {
+        let esc = match b {
+            b'"' => "\\\"",
+            b'\\' => "\\\\",
+            b'\n' => "\\n",
+            b'\r' => "\\r",
+            b'\t' => "\\t",
+            0..=0x1f => {
+                o.push_str(&s[plain..i]);
+                plain = i + 1;
+                let _ = write!(o, "\\u{b:04x}");
+                continue;
+            }
+            _ => continue,
+        };
+        o.push_str(&s[plain..i]);
+        plain = i + 1;
+        o.push_str(esc);
+    }
+    o.push_str(&s[plain..]);
+    o.push('"');
 }
 
 /// JSON string literal (with quotes). Non-ASCII passes through; control chars are escaped.
+#[cfg(test)]
 pub fn json_str(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
-            c => o.push(c),
-        }
-    }
-    o.push('"');
+    let mut o = String::new();
+    json_push(&mut o, s);
     o
 }
 
 /// Fast token estimate: ASCII chars / 3.6 (rounded up) + 1 per non-ASCII char.
 /// Slightly pessimistic for English prose (~4 chars/token) so budgets are never overshot.
 pub fn est_tokens(s: &str) -> usize {
+    // every char is one byte < 0x80 (ASCII) or exactly one lead byte >= 0xC0
     let (mut ascii, mut other) = (0usize, 0usize);
-    for c in s.chars() {
-        if c.is_ascii() {
-            ascii += 1;
-        } else {
-            other += 1;
-        }
+    for &c in s.as_bytes() {
+        ascii += (c < 0x80) as usize;
+        other += (c >= 0xC0) as usize;
     }
     (ascii * 5 + 17) / 18 + other
 }
 
 /// Cut `s` to ~`tok` tokens at a line boundary and append a marker line saying how much was dropped.
 /// The first line is always kept (lines are never cut), so one huge line may exceed `tok`.
-pub fn clip(s: String, tok: usize) -> String {
-    if est_tokens(&s) <= tok {
+pub fn clip(mut s: String, tok: usize) -> String {
+    let total = est_tokens(&s);
+    if total <= tok {
         return s;
     }
     let budget = tok.saturating_sub(6);
     let (mut used, mut end) = (0usize, 0usize);
     for line in s.split_inclusive('\n') {
-        let c = est_tokens(line);
+        let c = if line.len() == s.len() { total } else { est_tokens(line) };
         if end > 0 && used + c > budget {
             break;
         }
@@ -262,13 +320,16 @@ pub fn clip(s: String, tok: usize) -> String {
             }
             let cut = rest[..cut].rfind(' ').filter(|&p| p > room / 2).unwrap_or(cut);
             let dropped = est_tokens(&rest[cut..]);
-            return format!("{}{}…\n…[-{dropped} tok]", &s[..end], &rest[..cut]);
+            s.truncate(end + cut);
+            let _ = write!(s, "…\n…[-{dropped} tok]");
+            return s;
         }
     }
     let dropped = est_tokens(&s[end..]);
-    let mut out = s[..end].trim_end_matches('\n').to_string();
-    out.push_str(&format!("\n…[-{dropped} tok]"));
-    out
+    s.truncate(end);
+    s.truncate(s.trim_end_matches('\n').len());
+    let _ = write!(s, "\n…[-{dropped} tok]");
+    s
 }
 
 // ---------------------------------------------------------------- names
@@ -277,17 +338,37 @@ const SUFFIXES: &[&str] = &["jr", "sr", "ii", "iii", "iv"];
 const CAP_PARTICLES: &[&str] = &["von", "der", "den", "de", "del", "della", "di", "da", "dos", "du", "ten", "ter"];
 const COLLAB_WORDS: &[&str] = &["collaboration", "consortium", "team", "group", "committee", "project", "network"];
 
-fn is_particle(tok: &str) -> bool {
-    match tok.chars().next() {
-        Some(c) if c.is_lowercase() || c == '\'' || c == '\u{2019}' => true,
-        _ => CAP_PARTICLES.contains(&tok.to_lowercase().as_str()),
+/// `words` (lowercase ASCII) contains `w` ignoring case; no allocation for ASCII `w`.
+fn in_ci(words: &[&str], w: &str) -> bool {
+    if w.is_ascii() {
+        words.iter().any(|x| x.eq_ignore_ascii_case(w))
+    } else {
+        words.contains(&w.to_lowercase().as_str())
     }
 }
 
+fn is_particle(tok: &str) -> bool {
+    match tok.chars().next() {
+        Some(c) if c.is_lowercase() || c == '\'' || c == '\u{2019}' => true,
+        _ => in_ci(CAP_PARTICLES, tok),
+    }
+}
+
+/// A name split into given tokens, surname and suffix. The tokens borrow from the name; `given` is a
+/// sub-slice of `toks`.
 struct Name<'a> {
-    given: Vec<&'a str>,
-    surname: String,
+    toks: Vec<&'a str>,
+    given: std::ops::Range<usize>,
+    surname: Cow<'a, str>,
     suffix: Option<&'a str>,
+    /// Written surname-first ("Smirnov A. Yu.").
+    surname_first: bool,
+}
+
+impl<'a> Name<'a> {
+    fn given(&self) -> &[&'a str] {
+        &self.toks[self.given.clone()]
+    }
 }
 
 /// "Smirnov A. Yu.": one full word followed only by dotted initials.
@@ -305,74 +386,85 @@ pub fn is_initials(t: &str) -> bool {
 
 fn parse_name(name: &str) -> Option<Name<'_>> {
     let mut toks: Vec<&str> = name.split_whitespace().collect();
-    if toks.len() < 2 || toks.iter().any(|t| COLLAB_WORDS.contains(&t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase().as_str())) {
+    if toks.len() < 2 || toks.iter().any(|t| in_ci(COLLAB_WORDS, t.trim_matches(|c: char| !c.is_alphanumeric()))) {
         return None;
     }
     let suffix = match toks.last() {
-        Some(l) if toks.len() >= 3 && SUFFIXES.contains(&l.trim_end_matches('.').to_lowercase().as_str()) => toks.pop(),
+        Some(l) if toks.len() >= 3 && in_ci(SUFFIXES, l.trim_end_matches('.')) => toks.pop(),
         _ => None,
     };
+    let len = toks.len();
     // "van der Waerden, Bartel Leendert": everything up to the comma is the surname
     // "Smirnov A. Yu.": a trailing run of initials means the name is written surname-first
     if surname_first(&toks) {
-        return Some(Name { given: toks[1..].to_vec(), surname: toks[0].to_string(), suffix });
+        let surname = Cow::Borrowed(toks[0]);
+        return Some(Name { toks, given: 1..len, surname, suffix, surname_first: true });
     }
-    if let Some(ci) = toks.iter().position(|t| t.ends_with(',')).filter(|&ci| ci + 1 < toks.len()) {
-        let sur = toks[..=ci].join(" ").trim_end_matches(',').to_string();
-        return Some(Name { given: toks[ci + 1..].to_vec(), surname: sur, suffix });
+    if let Some(ci) = toks.iter().position(|t| t.ends_with(',')).filter(|&ci| ci + 1 < len) {
+        let sur = if ci == 0 { Cow::Borrowed(toks[0].trim_end_matches(',')) } else { Cow::Owned(toks[..=ci].join(" ").trim_end_matches(',').to_string()) };
+        return Some(Name { toks, given: ci + 1..len, surname: sur, suffix, surname_first: false });
     }
-    let last = toks.len() - 1;
+    let last = len - 1;
     let s = (1..last).find(|&i| is_particle(toks[i])).unwrap_or(last);
-    Some(Name { given: toks[..s].to_vec(), surname: toks[s..].join(" "), suffix })
+    let surname = if s == last { Cow::Borrowed(toks[last]) } else { Cow::Owned(toks[s..].join(" ")) };
+    Some(Name { toks, given: 0..s, surname, suffix, surname_first: false })
 }
 
-fn initial_of(tok: &str) -> String {
+/// Append the initial(s) of one given-name token; returns whether anything was written.
+fn push_initial(tok: &str, out: &mut String) -> bool {
+    let start = out.len();
     // packed dotted initials ("Yu.A.") are separate initials ("Yu. A.")
     if tok.matches('.').count() >= 2 && !tok.contains('-') {
-        let parts: Vec<String> = tok.split_inclusive('.').filter(|p| p.chars().any(char::is_alphabetic)).map(initial_of).collect();
-        return parts.join(" ");
-    }
-    let parts: Vec<String> = tok
-        .split('-')
-        .map(|part| {
-            let mut v = String::new();
-            let letters = part.chars().filter(|c| c.is_alphabetic());
-            let chars: Vec<char> = part.chars().collect();
-            // a transliterated given-name initial ("Yu.", "Zh.") is one initial, not two
-            let digraph = chars.len() == 3 && chars[2] == '.' && chars[0].is_uppercase() && chars[1].is_lowercase();
-            if digraph {
-                v.push_str(part);
-            } else if part.contains('.') {
-                for c in letters {
-                    if !v.is_empty() {
-                        v.push(' ');
-                    }
-                    v.push(c);
-                    v.push('.');
-                }
-            } else if let Some(c) = letters.into_iter().next() {
-                v.push(c);
-                v.push('.');
+        let mut first = true;
+        for piece in tok.split_inclusive('.').filter(|p| p.chars().any(char::is_alphabetic)) {
+            if !first {
+                out.push(' ');
             }
-            v
-        })
-        .filter(|v| !v.is_empty())
-        .collect();
-    parts.join("-")
+            first = false;
+            push_initial(piece, out);
+        }
+        return out.len() > start;
+    }
+    let mut wrote = false;
+    for part in tok.split('-') {
+        let mark = out.len();
+        if wrote {
+            out.push('-');
+        }
+        let body = out.len();
+        let mut cs = part.chars();
+        // a transliterated given-name initial ("Yu.", "Zh.") is one initial, not two
+        let digraph = matches!((cs.next(), cs.next(), cs.next(), cs.next()), (Some(a), Some(b), Some('.'), None) if a.is_uppercase() && b.is_lowercase());
+        if digraph {
+            out.push_str(part);
+        } else if part.contains('.') {
+            for c in part.chars().filter(|c| c.is_alphabetic()) {
+                if out.len() > body {
+                    out.push(' ');
+                }
+                out.push(c);
+                out.push('.');
+            }
+        } else if let Some(c) = part.chars().find(|c| c.is_alphabetic()) {
+            out.push(c);
+            out.push('.');
+        }
+        if out.len() == body {
+            out.truncate(mark);
+        } else {
+            wrote = true;
+        }
+    }
+    out.len() > start
 }
 
-/// "Terence Tao" -> "T. Tao"; "Bartel Leendert van der Waerden" -> "B. L. van der Waerden";
-/// "Jean-Pierre Serre" -> "J.-P. Serre"; "Tao, Terence" -> "T. Tao". Collaboration names and
-/// single-token names are returned unchanged (whitespace-collapsed).
-pub fn initials(name: &str) -> String {
+fn push_initials(name: &str, out: &mut String) {
     let Some(n) = parse_name(name) else {
-        return collapse(name);
+        out.push_str(&collapse(name));
+        return;
     };
-    let mut out = String::with_capacity(name.len());
-    for g in &n.given {
-        let ini = initial_of(g);
-        if !ini.is_empty() {
-            out.push_str(&ini);
+    for g in n.given() {
+        if push_initial(g, out) {
             out.push(' ');
         }
     }
@@ -381,6 +473,14 @@ pub fn initials(name: &str) -> String {
         out.push(' ');
         out.push_str(s);
     }
+}
+
+/// "Terence Tao" -> "T. Tao"; "Bartel Leendert van der Waerden" -> "B. L. van der Waerden";
+/// "Jean-Pierre Serre" -> "J.-P. Serre"; "Tao, Terence" -> "T. Tao". Collaboration names and
+/// single-token names are returned unchanged (whitespace-collapsed).
+pub fn initials(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    push_initials(name, &mut out);
     out
 }
 
@@ -392,13 +492,13 @@ pub fn short_authors(authors: &[String], max: usize) -> String {
         if i > 0 {
             out.push_str(", ");
         }
-        out.push_str(&initials(a));
+        push_initials(a, &mut out);
     }
     if authors.len() > shown {
         if !out.is_empty() {
             out.push(' ');
         }
-        out.push_str(&format!("+{}", authors.len() - shown));
+        let _ = write!(out, "+{}", authors.len() - shown);
     }
     out
 }
@@ -429,127 +529,204 @@ pub fn short_insts(v: &[String]) -> String {
     out.join("; ")
 }
 
-fn join_collapsed(v: &[String], sep: &str) -> String {
-    collapse(&v.join(sep))
+fn join_collapsed<'a>(v: &'a [String], sep: &str) -> Cow<'a, str> {
+    match v {
+        [] => Cow::Borrowed(""),
+        [one] => collapse(one),
+        _ => Cow::Owned(collapse_string(v.join(sep))),
+    }
 }
 
-fn cell(p: &Paper, f: Field, o: &Fmt) -> String {
+fn join_cow<'a>(v: &'a [String], sep: &str) -> Cow<'a, str> {
+    match v {
+        [] => Cow::Borrowed(""),
+        [one] => Cow::Borrowed(one),
+        _ => Cow::Owned(v.join(sep)),
+    }
+}
+
+fn cell<'a>(p: &'a Paper, f: Field, o: &Fmt) -> Cow<'a, str> {
     match f {
-        Field::Id => p.id.clone(),
+        Field::Id => Cow::Borrowed(&p.id),
         Field::Ver => {
             if p.ver > 0 {
-                format!("v{}", p.ver)
+                Cow::Owned(format!("v{}", p.ver))
             } else {
-                String::new()
+                Cow::Borrowed("")
             }
         }
         Field::T => collapse(&p.title),
-        Field::A => short_authors(&p.authors, o.aumax()),
+        Field::A => Cow::Owned(short_authors(&p.authors, o.aumax())),
         Field::Aff => join_collapsed(&p.affs, "; "),
         Field::Inst => {
             if o.full() {
                 join_collapsed(&p.insts, "; ")
             } else {
-                short_insts(&p.insts)
+                Cow::Owned(short_insts(&p.insts))
             }
         }
-        Field::D => p.published.get(..7).unwrap_or(&p.published).to_string(),
-        Field::Dd => p.date().to_string(),
-        Field::U => p.updated_date().to_string(),
-        Field::C => p.cats.join(" "),
-        Field::Pc => p.primary().to_string(),
-        Field::Ab => trunc(&collapse(&p.abs), o.abslen()),
+        Field::D => Cow::Borrowed(p.published.get(..7).unwrap_or(&p.published)),
+        Field::Dd => Cow::Borrowed(p.date()),
+        Field::U => Cow::Borrowed(p.updated_date()),
+        Field::C => join_cow(&p.cats, " "),
+        Field::Pc => Cow::Borrowed(p.primary()),
+        Field::Ab => collapse_trunc(&p.abs, o.abslen()),
         Field::Co => p.comment.as_deref().map(collapse).unwrap_or_default(),
         Field::Jr => p.jref.as_deref().map(collapse).unwrap_or_default(),
-        Field::Doi => p.doi.clone().unwrap_or_default(),
-        Field::Pub => (if p.is_published() { "P" } else { "-" }).to_string(),
-        Field::Q => p.venue.map(|v| format!("Q{}", v.q)).unwrap_or_else(|| "-".into()),
-        Field::V => p.venue.map(|v| v.name.to_string()).unwrap_or_default(),
-        Field::Msc => p.msc.join(" "),
-        Field::Url => p.url(),
-        Field::Pdf => format!("https://arxiv.org/pdf/{}", p.id),
+        Field::Doi => Cow::Borrowed(p.doi.as_deref().unwrap_or("")),
+        Field::Pub => Cow::Borrowed(if p.is_published() { "P" } else { "-" }),
+        Field::Q => p.venue.map(|v| qkey(v.q)).unwrap_or(Cow::Borrowed("-")),
+        Field::V => Cow::Borrowed(p.venue.map(|v| v.name).unwrap_or("")),
+        Field::Msc => join_cow(&p.msc, " "),
+        Field::Url => Cow::Owned(p.url()),
+        Field::Pdf => Cow::Owned(format!("https://arxiv.org/pdf/{}", p.id)),
     }
 }
 
-fn esc_pipe(s: &str) -> String {
-    s.replace('|', "\\|")
+/// "Q1".."Q4" (the only values venues carry) without allocating.
+fn qkey(q: u8) -> Cow<'static, str> {
+    match q {
+        1 => Cow::Borrowed("Q1"),
+        2 => Cow::Borrowed("Q2"),
+        3 => Cow::Borrowed("Q3"),
+        4 => Cow::Borrowed("Q4"),
+        _ => Cow::Owned(format!("Q{q}")),
+    }
 }
 
-fn render_l(ps: &[Paper], f: &Fmt) -> (Vec<String>, Vec<String>) {
-    let ab = f.fields.contains(&Field::Ab);
-    let mut cols: Vec<Field> = f.fields.iter().copied().filter(|c| *c != Field::Ab).collect();
-    if cols.is_empty() {
-        cols.push(Field::Id);
+fn push_esc_pipe(out: &mut String, s: &str) {
+    if s.contains('|') {
+        out.push_str(&s.replace('|', "\\|"));
+    } else {
+        out.push_str(s);
     }
-    let rows: Vec<Vec<String>> = ps.iter().map(|p| cols.iter().map(|c| esc_pipe(&cell(p, *c, f))).collect()).collect();
-    let mut keep: Vec<bool> = (0..cols.len()).map(|j| rows.iter().any(|r| !r[j].is_empty())).collect();
-    if !keep.iter().any(|k| *k) {
-        keep[0] = true;
-    }
-    let chunks = ps
-        .iter()
-        .zip(&rows)
-        .map(|(p, r)| {
-            let mut line = r.iter().zip(&keep).filter(|(_, k)| **k).map(|(c, _)| c.as_str()).collect::<Vec<_>>().join("|");
-            if ab {
-                let a = cell(p, Field::Ab, f);
-                if !a.is_empty() {
-                    line.push_str("\n ");
-                    line.push_str(&a);
+}
+
+/// Appends paper `i` to the output being built.
+type Row<'a> = Box<dyn FnMut(usize, &mut String) + 'a>;
+
+/// Header lines and the per-paper renderer of `f.format` (`l` drops columns that are empty for every paper).
+fn row_renderer<'a>(ps: &'a [Paper], f: &'a Fmt) -> (Vec<String>, Row<'a>) {
+    match f.format {
+        Format::L => {
+            let ab = f.fields.contains(&Field::Ab);
+            let mut cols: Vec<Field> = f.fields.iter().copied().filter(|c| *c != Field::Ab).collect();
+            if cols.is_empty() {
+                cols.push(Field::Id);
+            }
+            // a column is kept when some paper has a value for it; stop evaluating a column once one does
+            let mut keep = vec![false; cols.len()];
+            let mut open = cols.len();
+            'scan: for p in ps {
+                for (j, c) in cols.iter().enumerate() {
+                    if !keep[j] && !cell(p, *c, f).is_empty() {
+                        keep[j] = true;
+                        open -= 1;
+                        if open == 0 {
+                            break 'scan;
+                        }
+                    }
                 }
             }
-            line
-        })
-        .collect();
-    (Vec::new(), chunks)
+            if !keep.iter().any(|k| *k) {
+                keep[0] = true;
+            }
+            let row = move |i: usize, out: &mut String| {
+                let p = &ps[i];
+                let mut first = true;
+                for (c, _) in cols.iter().zip(&keep).filter(|(_, k)| **k) {
+                    if !first {
+                        out.push('|');
+                    }
+                    first = false;
+                    push_esc_pipe(out, &cell(p, *c, f));
+                }
+                if ab {
+                    let a = cell(p, Field::Ab, f);
+                    if !a.is_empty() {
+                        out.push_str("\n ");
+                        out.push_str(&a);
+                    }
+                }
+            };
+            (Vec::new(), Box::new(row))
+        }
+        Format::Tsv => {
+            let head = f.fields.iter().map(|c| c.code()).collect::<Vec<_>>().join("\t");
+            let row = move |i: usize, out: &mut String| {
+                for (j, c) in f.fields.iter().enumerate() {
+                    if j > 0 {
+                        out.push('\t');
+                    }
+                    out.push_str(&cell(&ps[i], *c, f));
+                }
+            };
+            (vec![head], Box::new(row))
+        }
+        Format::Json | Format::Jsonl => (Vec::new(), Box::new(move |i: usize, out: &mut String| json_obj(out, &ps[i], f))),
+        Format::Ids => (Vec::new(), Box::new(move |i: usize, out: &mut String| out.push_str(&ps[i].id))),
+        Format::Bib => {
+            // distinct papers must never share a citation key
+            let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let row = move |i: usize, out: &mut String| {
+                let p = &ps[i];
+                let base = bib_key(p);
+                let mut key = base.clone();
+                let mut k = 0u32;
+                while !taken.insert(key.clone()) {
+                    key = format!("{base}{}", alpha_suffix(k));
+                    k += 1;
+                }
+                bibtex_into(out, p, &key);
+            };
+            (Vec::new(), Box::new(row))
+        }
+        Format::Md => (Vec::new(), Box::new(move |i: usize, out: &mut String| render_md(out, &ps[i], f))),
+    }
 }
 
-fn render_tsv(ps: &[Paper], f: &Fmt) -> (Vec<String>, Vec<String>) {
-    let head = f.fields.iter().map(|c| c.code()).collect::<Vec<_>>().join("\t");
-    let chunks = ps.iter().map(|p| f.fields.iter().map(|c| cell(p, *c, f)).collect::<Vec<_>>().join("\t")).collect();
-    (vec![head], chunks)
-}
-
-fn json_obj(p: &Paper, f: &Fmt) -> String {
-    let mut o = String::from("{");
+fn json_obj(o: &mut String, p: &Paper, f: &Fmt) {
+    let start = o.len();
+    o.push('{');
     for fl in &f.fields {
-        let v = if *fl == Field::Ver {
+        let mark = o.len();
+        if o.len() > start + 1 {
+            o.push(',');
+        }
+        o.push('"');
+        o.push_str(fl.code());
+        o.push_str("\":");
+        if *fl == Field::Ver {
             if p.ver == 0 {
+                o.truncate(mark);
                 continue;
             }
-            p.ver.to_string()
+            let _ = write!(o, "{}", p.ver);
         } else {
             let c = cell(p, *fl, f);
             if c.is_empty() {
+                o.truncate(mark);
                 continue;
             }
-            json_str(&c)
-        };
-        if o.len() > 1 {
-            o.push(',');
+            json_push(o, &c);
         }
-        o.push_str(&json_str(fl.code()));
-        o.push(':');
-        o.push_str(&v);
     }
     o.push('}');
-    o
 }
 
-fn render_md(p: &Paper, f: &Fmt) -> String {
-    let mut s = format!("- [{}]({}) **{}**", p.id, p.url(), collapse(&p.title));
+fn render_md(s: &mut String, p: &Paper, f: &Fmt) {
+    let _ = write!(s, "- [{}](https://arxiv.org/abs/{}) **{}**", p.id, p.id, collapse(&p.title));
     if !p.authors.is_empty() {
         s.push_str(" — ");
         s.push_str(&short_authors(&p.authors, f.aumax()));
     }
     if let Some(d) = p.published.get(..7) {
-        s.push_str(&format!(" ({d})"));
+        let _ = write!(s, " ({d})");
     }
     if f.fields.contains(&Field::Ab) && !p.abs.is_empty() {
         s.push_str("\n  ");
         s.push_str(&cell(p, Field::Ab, f));
     }
-    s
 }
 
 /// Render paper list. `total` = server-reported total matches when known.
@@ -564,43 +741,35 @@ pub fn papers(ps: &[Paper], total: Option<usize>, f: &Fmt) -> String {
         };
     }
     let n = ps.len();
-    let (head, chunks): (Vec<String>, Vec<String>) = match f.format {
-        Format::L => render_l(ps, f),
-        Format::Tsv => render_tsv(ps, f),
-        Format::Json | Format::Jsonl => (Vec::new(), ps.iter().map(|p| json_obj(p, f)).collect()),
-        Format::Ids => (Vec::new(), ps.iter().map(|p| p.id.clone()).collect()),
-        Format::Bib => {
-            // distinct papers must never share a citation key
-            let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
-            let entries = ps
-                .iter()
-                .map(|p| {
-                    let base = bib_key(p);
-                    let mut key = base.clone();
-                    let mut k = 0u32;
-                    while !taken.insert(key.clone()) {
-                        key = format!("{base}{}", alpha_suffix(k));
-                        k += 1;
-                    }
-                    bibtex_keyed(p, &key)
-                })
-                .collect();
-            (Vec::new(), entries)
-        }
-        Format::Md => (Vec::new(), ps.iter().map(|p| render_md(p, f)).collect()),
+    let (head, mut row) = row_renderer(ps, f);
+    let (open, sep) = match f.format {
+        Format::Json => ("[".to_string(), ","),
+        Format::Jsonl => (String::new(), "\n"),
+        Format::Bib => (head.join("\n"), "\n\n"),
+        _ => (head.join("\n"), "\n"),
     };
+    let mut s = open;
+    if !matches!(f.format, Format::Json | Format::Jsonl) && !s.is_empty() {
+        s.push('\n');
+    }
     let of = total.unwrap_or(n).max(n);
-    let mut k = n;
-    if let Some(budget) = f.tok {
-        let mut used: usize = head.iter().map(|h| est_tokens(h) + 1).sum::<usize>() + 12;
-        k = 0;
-        for c in &chunks {
-            used += est_tokens(c) + 1;
+    let mut used: usize = head.iter().map(|h| est_tokens(h) + 1).sum::<usize>() + 12;
+    let mut k = 0;
+    while k < n {
+        let mark = s.len();
+        if k > 0 {
+            s.push_str(sep);
+        }
+        let start = s.len();
+        row(k, &mut s);
+        if let Some(budget) = f.tok {
+            used += est_tokens(&s[start..]) + 1;
             if k > 0 && used > budget {
+                s.truncate(mark);
                 break;
             }
-            k += 1;
         }
+        k += 1;
     }
     let footer = if k < n {
         Some((k, of, true))
@@ -609,37 +778,26 @@ pub fn papers(ps: &[Paper], total: Option<usize>, f: &Fmt) -> String {
     } else {
         None
     };
-    let shown = &chunks[..k];
     match f.format {
         Format::Json => {
-            let mut s = format!("[{}", shown.join(","));
             if let Some((k, of, _)) = footer {
-                s.push_str(&format!(",{{\"showing\":{k},\"of\":{of}}}"));
+                let _ = write!(s, ",{{\"showing\":{k},\"of\":{of}}}");
             }
             s.push(']');
-            s
         }
         Format::Jsonl => {
-            let mut s = shown.join("\n");
             if let Some((k, of, _)) = footer {
-                s.push_str(&format!("\n{{\"showing\":{k},\"of\":{of}}}"));
+                let _ = write!(s, "\n{{\"showing\":{k},\"of\":{of}}}");
             }
-            s
         }
         fm => {
-            let sep = if fm == Format::Bib { "\n\n" } else { "\n" };
-            let mut s = head.join("\n");
-            if !s.is_empty() {
-                s.push('\n');
-            }
-            s.push_str(&shown.join(sep));
             // `ids` stays strictly one id per line (pipeline friendly): no footer
             if let (Some((k, of, budget)), false) = (footer, fm == Format::Ids) {
-                s.push_str(&format!("{}(showing {k} of {of}{})", sep, if budget { ", budget" } else { "" }));
+                let _ = write!(s, "{}(showing {k} of {of}{})", sep, if budget { ", budget" } else { "" });
             }
-            s
         }
     }
+    s
 }
 
 // ---------------------------------------------------------------- facets
@@ -647,11 +805,14 @@ pub fn papers(ps: &[Paper], total: Option<usize>, f: &Fmt) -> String {
 const FACETS: &str = "cat,pcat,year,month,au,q,venue,pub,inst";
 const FACET_TOP: usize = 15;
 
-fn bump(m: &mut HashMap<String, usize>, k: &str) {
-    if let Some(c) = m.get_mut(k) {
+type Counts<'a> = HashMap<Cow<'a, str>, usize>;
+
+fn bump<'a>(m: &mut Counts<'a>, k: impl Into<Cow<'a, str>>) {
+    let k = k.into();
+    if let Some(c) = m.get_mut(&*k) {
         *c += 1;
     } else {
-        m.insert(k.to_string(), 1);
+        m.insert(k, 1);
     }
 }
 
@@ -661,38 +822,38 @@ pub fn facets(ps: &[Paper], by: &[String]) -> String {
     }
     let mut lines = Vec::new();
     for b in by {
-        let mut m: HashMap<String, usize> = HashMap::new();
+        let mut m: Counts = HashMap::new();
         match b.as_str() {
-            "cat" => ps.iter().flat_map(|p| p.cats.iter()).for_each(|c| bump(&mut m, c)),
+            "cat" => ps.iter().flat_map(|p| p.cats.iter()).for_each(|c| bump(&mut m, c.as_str())),
             "pcat" => ps.iter().filter(|p| !p.primary().is_empty()).for_each(|p| bump(&mut m, p.primary())),
             "year" => ps.iter().filter(|p| !p.year().is_empty()).for_each(|p| bump(&mut m, p.year())),
             "month" => ps.iter().filter_map(|p| p.published.get(..7)).for_each(|d| bump(&mut m, d)),
             "au" => {
                 // count full names; show initials unless two distinct people would collide ("A. Smith")
-                let mut full: HashMap<String, usize> = HashMap::new();
-                ps.iter().flat_map(|p| p.authors.iter()).for_each(|a| bump(&mut full, &collapse(a)));
-                let mut by_initials: HashMap<String, Vec<(String, usize)>> = HashMap::new();
+                let mut full: Counts = HashMap::new();
+                ps.iter().flat_map(|p| p.authors.iter()).for_each(|a| bump(&mut full, collapse(a)));
+                let mut by_initials: HashMap<String, Vec<(Cow<str>, usize)>> = HashMap::new();
                 for (f, c) in full {
                     by_initials.entry(initials(&f)).or_default().push((f, c));
                 }
                 for (short, list) in by_initials {
                     if list.len() == 1 {
-                        m.insert(short, list[0].1);
+                        m.insert(Cow::Owned(short), list[0].1);
                     } else {
                         m.extend(list);
                     }
                 }
             }
-            "q" => ps.iter().for_each(|p| bump(&mut m, &p.venue.map(|v| format!("Q{}", v.q)).unwrap_or_else(|| "?".into()))),
+            "q" => ps.iter().for_each(|p| bump(&mut m, p.venue.map(|v| qkey(v.q)).unwrap_or(Cow::Borrowed("?")))),
             "venue" => ps.iter().filter_map(|p| p.venue).for_each(|v| bump(&mut m, v.name)),
             "pub" => ps.iter().for_each(|p| bump(&mut m, if p.is_published() { "P" } else { "-" })),
-            "inst" => ps.iter().flat_map(|p| p.insts.iter()).for_each(|i| bump(&mut m, &collapse(i))),
+            "inst" => ps.iter().flat_map(|p| p.insts.iter()).for_each(|i| bump(&mut m, collapse(i))),
             x => {
                 lines.push(format!("unknown facet {x:?}; valid: {FACETS}"));
                 continue;
             }
         }
-        let mut v: Vec<(String, usize)> = m.into_iter().collect();
+        let mut v: Vec<(Cow<str>, usize)> = m.into_iter().collect();
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let rest = v.len().saturating_sub(FACET_TOP);
         let mut line = format!("{b}:");
@@ -701,10 +862,10 @@ pub fn facets(ps: &[Paper], by: &[String]) -> String {
         }
         for (i, (k, c)) in v.iter().take(FACET_TOP).enumerate() {
             line.push_str(if i == 0 { " " } else { ", " });
-            line.push_str(&format!("{k} {c}"));
+            let _ = write!(line, "{k} {c}");
         }
         if rest > 0 {
-            line.push_str(&format!(", +{rest}"));
+            let _ = write!(line, ", +{rest}");
         }
         lines.push(line);
     }
@@ -713,7 +874,7 @@ pub fn facets(ps: &[Paper], by: &[String]) -> String {
 
 // ---------------------------------------------------------------- bibtex
 
-fn fold_ascii(s: &str) -> String {
+fn fold_ascii_into(s: &str, o: &mut String) {
     const MAP: &[(&str, &str)] = &[
         ("àáâãäåāăąÀÁÂÃÄÅĀĂĄ", "a"),
         ("æÆ", "ae"),
@@ -739,7 +900,6 @@ fn fold_ascii(s: &str) -> String {
         ("ýÿŷÝŶŸ", "y"),
         ("źżžŹŻŽ", "z"),
     ];
-    let mut o = String::new();
     for c in s.chars() {
         if c.is_ascii_alphanumeric() {
             o.push(c.to_ascii_lowercase());
@@ -747,28 +907,32 @@ fn fold_ascii(s: &str) -> String {
             o.push_str(r);
         }
     }
-    o
 }
 
 const TITLE_SKIP: &[&str] = &["a", "an", "the", "on", "of", "in", "for", "and", "to"];
 
 fn bib_key(p: &Paper) -> String {
-    let sur = p
-        .authors
-        .first()
-        .map(|a| match parse_name(a) {
-            Some(n) => fold_ascii(&n.surname),
-            None => fold_ascii(a),
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "anon".into());
-    let word = p
-        .title
-        .split_whitespace()
-        .map(fold_ascii)
-        .find(|w| !w.is_empty() && !TITLE_SKIP.contains(&w.as_str()))
-        .unwrap_or_default();
-    format!("{sur}{}{word}", p.year())
+    let mut key = String::with_capacity(32);
+    if let Some(a) = p.authors.first() {
+        match parse_name(a) {
+            Some(n) => fold_ascii_into(&n.surname, &mut key),
+            None => fold_ascii_into(a, &mut key),
+        }
+    }
+    if key.is_empty() {
+        key.push_str("anon");
+    }
+    key.push_str(p.year());
+    let mut word = String::new();
+    for w in p.title.split_whitespace() {
+        word.clear();
+        fold_ascii_into(w, &mut word);
+        if !word.is_empty() && !TITLE_SKIP.contains(&word.as_str()) {
+            key.push_str(&word);
+            break;
+        }
+    }
+    key
 }
 
 /// b, c, ..., z, bb, bc, ... (bijective base 25 over b..z): unbounded and unique per index.
@@ -784,8 +948,7 @@ fn alpha_suffix(k: u32) -> String {
     String::from_utf8(s).unwrap()
 }
 
-fn bib_esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len());
+fn bib_esc_into(o: &mut String, s: &str) {
     let mut prev = ' ';
     for c in s.chars() {
         if matches!(c, '%' | '&' | '#') && prev != '\\' {
@@ -794,45 +957,64 @@ fn bib_esc(s: &str) -> String {
         o.push(c);
         prev = c;
     }
-    o
 }
 
 /// One BibTeX author: corporate/collaboration names are braced (one unit), suffixes use the
 /// `Surname, Jr., Given` form so BibTeX does not mistake "Jr." for the surname.
-fn bib_author(a: &str) -> String {
+fn bib_author_into(o: &mut String, a: &str) {
     let a = collapse(a);
     match parse_name(&a) {
-        None => format!("{{{}}}", bib_esc(&a)),
+        None => {
+            o.push('{');
+            bib_esc_into(o, &a);
+            o.push('}');
+        }
         Some(n) => match n.suffix {
-            Some(suf) => bib_esc(&format!("{}, {}, {}", n.surname.trim_end_matches(','), suf, n.given.join(" ").trim_end_matches(','))),
+            Some(suf) => bib_esc_into(o, &format!("{}, {}, {}", n.surname.trim_end_matches(','), suf, n.given().join(" ").trim_end_matches(','))),
             // written surname-first ("Smirnov A. Yu."): BibTeX needs the comma form to find the surname
-            None if surname_first(&a.split_whitespace().collect::<Vec<_>>()) => bib_esc(&format!("{}, {}", n.surname, n.given.join(" "))),
-            None => bib_esc(&a),
+            None if n.surname_first => bib_esc_into(o, &format!("{}, {}", n.surname, n.given().join(" "))),
+            None => bib_esc_into(o, &a),
         },
     }
 }
 
-fn bibtex_keyed(p: &Paper, key: &str) -> String {
+fn bibtex_into(s: &mut String, p: &Paper, key: &str) {
     let kind = if p.jref.is_some() { "article" } else { "misc" };
-    let mut s = format!("@{kind}{{{key},\ntitle={{{}}},", bib_esc(&collapse(&p.title)));
+    let _ = write!(s, "@{kind}{{{key},\ntitle={{");
+    bib_esc_into(s, &collapse(&p.title));
+    s.push_str("},");
     if !p.authors.is_empty() {
-        let names: Vec<String> = p.authors.iter().map(|a| bib_author(a)).collect();
-        s.push_str(&format!("\nauthor={{{}}},", names.join(" and ")));
+        s.push_str("\nauthor={");
+        for (i, a) in p.authors.iter().enumerate() {
+            if i > 0 {
+                s.push_str(" and ");
+            }
+            bib_author_into(s, a);
+        }
+        s.push_str("},");
     }
     if !p.year().is_empty() {
-        s.push_str(&format!("\nyear={{{}}},", p.year()));
+        let _ = write!(s, "\nyear={{{}}},", p.year());
     }
     if let Some(j) = &p.jref {
-        s.push_str(&format!("\njournal={{{}}},", bib_esc(&collapse(j))));
+        s.push_str("\njournal={");
+        bib_esc_into(s, &collapse(j));
+        s.push_str("},");
     }
     if let Some(d) = &p.doi {
-        s.push_str(&format!("\ndoi={{{d}}},"));
+        let _ = write!(s, "\ndoi={{{d}}},");
     }
-    s.push_str(&format!("\neprint={{{}}},\narchivePrefix={{arXiv}},", p.id));
+    let _ = write!(s, "\neprint={{{}}},\narchivePrefix={{arXiv}},", p.id);
     if !p.primary().is_empty() {
-        s.push_str(&format!("\nprimaryClass={{{}}},", p.primary()));
+        let _ = write!(s, "\nprimaryClass={{{}}},", p.primary());
     }
-    s.push_str(&format!("\nurl={{{}}}\n}}", p.url()));
+    let _ = write!(s, "\nurl={{https://arxiv.org/abs/{}}}\n}}", p.id);
+}
+
+#[cfg(test)]
+fn bibtex_keyed(p: &Paper, key: &str) -> String {
+    let mut s = String::new();
+    bibtex_into(&mut s, p, key);
     s
 }
 
@@ -1402,5 +1584,25 @@ mod tests {
         assert_eq!(alpha_suffix(0), "b");
         assert_eq!(alpha_suffix(24), "z");
         assert_eq!(alpha_suffix(25), "bb");
+    }
+
+    #[test]
+    fn collapse_borrows_clean_text_and_normalises_the_rest() {
+        for s in ["", "a b", " a", "a ", "a  b", "a\tb", "a\u{a0}b", "a\n", "\u{2003}", "é  è", "a b\r\n c"] {
+            let want = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(collapse(s), want, "{s:?}");
+            assert_eq!(matches!(collapse(s), Cow::Borrowed(_)), s == want, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn tok_budget_renders_only_what_it_keeps() {
+        let ps: Vec<Paper> = (0..50).map(|i| paper(&format!("2301.{i:05}"), "A fairly long title for this paper", &["Terence Tao"], &["math.NT"], "2023-01-03T10:00:00Z")).collect();
+        let all = papers(&ps, None, &fmt(&[], "id,a,t"));
+        let few = papers(&ps, None, &fmt(&["--tok", "60"], "id,a,t"));
+        let lines: Vec<&str> = few.lines().collect();
+        assert!(lines.len() < 50 && lines.last().unwrap().ends_with("budget)"), "{few}");
+        assert!(all.starts_with(&few[..few.rfind('\n').unwrap()]));
+        assert!(few.contains(&format!("(showing {} of 50, budget)", lines.len() - 1)));
     }
 }

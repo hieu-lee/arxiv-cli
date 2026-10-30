@@ -1,7 +1,7 @@
 //! Client-side post filters (author, institution, publication status, venue quartile, comment, ...).
 
 use crate::args::Args;
-use crate::fuzzy::{contains_fuzzy, contains_fuzzy_strict, AuthorQ};
+use crate::fuzzy::{contains_fuzzy, contains_fuzzy_strict, AuthorQ, AuthorView};
 use crate::model::Paper;
 
 const DEFAULT_FUZZ: f32 = 0.82;
@@ -328,10 +328,17 @@ impl Filter {
                 return false;
             }
         }
-        if !self.au.is_empty()
-            && !self.au.iter().all(|g| g.iter().any(|q| p.authors.iter().any(|a| q.score(a) >= self.fuzz)))
-        {
-            return false;
+        if let Some(first) = self.au.first() {
+            let ok = if self.au.len() == 1 && first.len() == 1 {
+                p.authors.iter().any(|a| first[0].score_view(&mut AuthorView::new(a)) >= self.fuzz)
+            } else {
+                // several queries score the same authors: parse each author once
+                let mut views: Vec<AuthorView> = p.authors.iter().map(|a| AuthorView::new(a)).collect();
+                self.au.iter().all(|g| g.iter().any(|q| views.iter_mut().any(|v| q.score_view(v) >= self.fuzz)))
+            };
+            if !ok {
+                return false;
+            }
         }
         Self::ensure_venue(p);
         true

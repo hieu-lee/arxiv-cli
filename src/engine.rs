@@ -51,9 +51,7 @@ async fn fetch_rows(net: &Net, built: &query::Built, start: usize, max: usize, m
         let feed = atom::parse(&xml)?;
         if !stale {
             // an expired page must not renew its papers' freshness in the store
-            for p in &feed.papers {
-                pstore::put(net, p);
-            }
+            pstore::put_all(net, &feed.papers);
         }
         memo.insert(chunk_start, (feed.papers, feed.total));
     }
@@ -93,10 +91,10 @@ pub async fn fetch_ids(net: &Net, ids: &[String]) -> Result<Vec<Paper>, String> 
             };
             match r {
                 Ok((papers, stale)) => {
+                    if !stale {
+                        pstore::put_all(net, &papers);
+                    }
                     for p in papers {
-                        if !stale {
-                            pstore::put(net, &p);
-                        }
                         have.insert(p.id.clone(), p);
                     }
                 }
@@ -347,9 +345,7 @@ async fn search_arxiv(net: &Net, a: &Args) -> Result<Found, String> {
                 let (xml, stale) = net.api_ex(&page_params(&built, slice, start, max)).await?;
                 let feed = atom::parse(&xml)?;
                 if !stale {
-                    for p in &feed.papers {
-                        pstore::put(net, p);
-                    }
+                    pstore::put_all(net, &feed.papers);
                 }
                 (feed.papers, feed.total)
             } else {
