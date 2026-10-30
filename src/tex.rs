@@ -4,7 +4,9 @@
 //! spaces, same length) so byte offsets found in the mask are valid, char-boundary-safe offsets
 //! into the original text.
 use crate::model::*;
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::Read;
 
 const MAX_TOTAL: usize = 64 << 20;
@@ -22,7 +24,10 @@ pub fn unpack(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
     let (data, gz_name);
     if bytes.starts_with(&[0x1f, 0x8b]) {
         let mut dec = flate2::read::GzDecoder::new(bytes);
-        let mut buf = Vec::new();
+        // the gzip trailer stores the uncompressed size (mod 2^32): a capacity hint that avoids regrowth
+        let hint = bytes.last_chunk::<4>().map_or(0, |t| u32::from_le_bytes(*t) as usize);
+        // deflate cannot expand beyond ~1032:1, so a lying trailer cannot force a huge reservation
+        let mut buf = Vec::with_capacity(hint.min(MAX_TOTAL).min(bytes.len().saturating_mul(1032)) + 1);
         (&mut dec)
             .take(MAX_TOTAL as u64 + 1)
             .read_to_end(&mut buf)
@@ -54,10 +59,10 @@ pub fn unpack(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
             }
             let Ok(p) = e.path() else { continue };
             let Some(name) = safe_name(&p) else { continue };
-            if !is_tex_source(&name) && ext(&name) != "bbl" {
+            if !is_tex_source(&name) && !ext(&name).eq_ignore_ascii_case("bbl") {
                 continue;
             }
-            let mut buf = Vec::new();
+            let mut buf = Vec::with_capacity((e.size() as usize).min(MAX_FILE).min(data.len()) + 1);
             if e.take(MAX_FILE as u64 + 1).read_to_end(&mut buf).is_err() || buf.len() > MAX_FILE {
                 continue;
             }
@@ -88,6 +93,9 @@ pub fn unpack(bytes: &[u8]) -> Result<Vec<(String, String)>, String> {
 /// Archive member name relative to the archive root; None for absolute or `..` paths.
 fn safe_name(p: &std::path::Path) -> Option<String> {
     use std::path::Component::*;
+    if let Some(s) = p.to_str().filter(|s| is_normal(s)) {
+        return Some(s.to_string());
+    }
     let mut parts = Vec::new();
     for c in p.components() {
         match c {
@@ -99,15 +107,21 @@ fn safe_name(p: &std::path::Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// LaTeX source extensions seen in arXiv submissions.
-fn is_tex_source(name: &str) -> bool {
-    matches!(ext(name).as_str(), "tex" | "ltx" | "latex")
+/// No empty, `.` or `..` segment and no leading `/`: already in the form `norm_path` produces.
+fn is_normal(p: &str) -> bool {
+    !p.is_empty() && !p.contains('\\') && p.split('/').all(|seg| !matches!(seg, "" | "." | ".."))
 }
 
-fn ext(name: &str) -> String {
+/// LaTeX source extensions seen in arXiv submissions.
+fn is_tex_source(name: &str) -> bool {
+    let e = ext(name);
+    ["tex", "ltx", "latex"].iter().any(|x| e.eq_ignore_ascii_case(x))
+}
+
+fn ext(name: &str) -> &str {
     match name.rsplit_once('.') {
-        Some((_, e)) if !e.contains('/') => e.to_ascii_lowercase(),
-        _ => String::new(),
+        Some((_, e)) if !e.contains('/') => e,
+        _ => "",
     }
 }
 
@@ -137,8 +151,70 @@ enum Dead {
     Verb,
 }
 
+const LO: u64 = 0x0101_0101_0101_0101;
+const HI: u64 = 0x8080_8080_8080_8080;
+
+/// Non-zero iff some byte of `v` equals `c`; the lowest set bit marks the first such byte.
+#[inline(always)]
+fn eq_mask(v: u64, c: u8) -> u64 {
+    let x = v ^ (LO * c as u64);
+    x.wrapping_sub(LO) & !x & HI
+}
+
+/// First position `>= from` whose byte is `c1` or `c2`, 8 bytes at a time.
+#[inline]
+fn find_either(b: &[u8], from: usize, c1: u8, c2: u8) -> Option<usize> {
+    let s = b.get(from..)?;
+    let mut chunks = s.chunks_exact(8);
+    let mut at = from;
+    for ch in &mut chunks {
+        let v = u64::from_le_bytes(ch.try_into().unwrap());
+        let m = eq_mask(v, c1) | eq_mask(v, c2);
+        if m != 0 {
+            return Some(at + (m.trailing_zeros() / 8) as usize);
+        }
+        at += 8;
+    }
+    chunks.remainder().iter().position(|&x| x == c1 || x == c2).map(|p| at + p)
+}
+
+/// Positions of every `%` and `\` in `b`: lets several scans share one pass over the text.
+fn hit_positions(b: &[u8]) -> Vec<u32> {
+    debug_assert!(b.len() < u32::MAX as usize, "tex source too large for u32 offsets");
+    let mut v = Vec::with_capacity(b.len() / 32 + 16);
+    let mut i = 0;
+    while let Some(p) = find_either(b, i, b'%', b'\\') {
+        v.push(p as u32);
+        i = p + 1;
+    }
+    v
+}
+
+/// Walker over `hits` (non-decreasing queries) returning the first hit at or after `from`.
+fn hit_walker(hits: &[u32]) -> impl FnMut(usize) -> Option<usize> + '_ {
+    let mut k = 0;
+    move |from| {
+        while k < hits.len() && (hits[k] as usize) < from {
+            k += 1;
+        }
+        hits.get(k).map(|&p| p as usize)
+    }
+}
+
+/// Like `hit_walker`, but only backslashes still present in the mask `m`.
+fn backslash_walker<'a>(hits: &'a [u32], m: &'a [u8]) -> impl FnMut(usize) -> Option<usize> + 'a {
+    let mut walk = hit_walker(hits);
+    move |mut from| loop {
+        let p = walk(from)?;
+        if m[p] == b'\\' {
+            return Some(p);
+        }
+        from = p + 1;
+    }
+}
+
 fn find_byte(b: &[u8], from: usize, c: u8) -> Option<usize> {
-    b.get(from..)?.iter().position(|&x| x == c).map(|p| p + from)
+    find_either(b, from, c, c)
 }
 
 fn find_sub(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
@@ -146,6 +222,20 @@ fn find_sub(b: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
     while let Some(p) = find_byte(b, i, pat[0]) {
         if b[p..].starts_with(pat) {
             return Some(p);
+        }
+        i = p + 1;
+    }
+    None
+}
+
+/// `\end{name}` at or after `from`: (start, end).
+fn find_end(b: &[u8], from: usize, name: &[u8]) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(p) = find_byte(b, i, b'\\') {
+        if let Some(r) = b[p + 1..].strip_prefix(b"end{").and_then(|r| r.strip_prefix(name)) {
+            if r.first() == Some(&b'}') {
+                return Some((p, p + 6 + name.len()));
+            }
         }
         i = p + 1;
     }
@@ -244,6 +334,12 @@ fn true_else_range(b: &[u8], from: usize) -> Option<(usize, usize)> {
 /// Sorted, disjoint ranges that are comments (`%..`, `comment` env) or verbatim bodies.
 fn dead_ranges(t: &str) -> Vec<(usize, usize, Dead)> {
     let b = t.as_bytes();
+    dead_ranges_by(t, |i| find_either(b, i, b'%', b'\\'))
+}
+
+/// `dead_ranges` with `next(i)` giving the first `%` or `\` at or after `i`.
+fn dead_ranges_by(t: &str, mut next: impl FnMut(usize) -> Option<usize>) -> Vec<(usize, usize, Dead)> {
+    let b = t.as_bytes();
     let n = b.len();
     let mut v = Vec::new();
     let mut i = 0;
@@ -260,7 +356,8 @@ fn dead_ranges(t: &str) -> Vec<(usize, usize, Dead)> {
                 if i >= n {
                     break;
                 }
-                if !b[i].is_ascii_alphabetic() {
+                // only url, href, if*, begin and verb matter here; other names hold no `%` or `\`
+                if !matches!(b[i], b'u' | b'h' | b'i' | b'b' | b'v') {
                     i += 1;
                     continue;
                 }
@@ -297,13 +394,10 @@ fn dead_ranges(t: &str) -> Vec<(usize, usize, Dead)> {
                     let Some(c) = find_byte(b, i, b'}') else { continue };
                     let env = &b[i + 1..c];
                     if is_verb_env(env) || env == b"comment" {
-                        let mut pat = b"\\end{".to_vec();
-                        pat.extend_from_slice(env);
-                        pat.push(b'}');
-                        if let Some(e) = find_sub(b, c + 1, &pat) {
+                        if let Some((e, q)) = find_end(b, c + 1, env) {
                             if env == b"comment" {
-                                v.push((bs, e + pat.len(), Dead::Comment));
-                                i = e + pat.len();
+                                v.push((bs, q, Dead::Comment));
+                                i = q;
                             } else {
                                 v.push((c + 1, e, Dead::Verb));
                                 i = e;
@@ -325,39 +419,55 @@ fn dead_ranges(t: &str) -> Vec<(usize, usize, Dead)> {
                     }
                 }
             }
-            _ => i += b[i..].iter().position(|&c| c == b'%' || c == b'\\').unwrap_or(n - i),
+            _ => i = next(i).unwrap_or(n),
         }
     }
     // ranges found inside an already-dead \else branch are redundant: keep a sorted, disjoint list
-    v.sort_by_key(|r| (r.0, std::cmp::Reverse(r.1)));
-    let mut out: Vec<(usize, usize, Dead)> = Vec::with_capacity(v.len());
-    for r in v {
-        if out.last().is_some_and(|l| r.0 < l.1) {
+    let key = |r: &(usize, usize, Dead)| (r.0, std::cmp::Reverse(r.1));
+    if !v.is_sorted_by(|a, b| key(a) <= key(b)) {
+        v.sort_by_key(key);
+    }
+    let mut w = 0;
+    for r in 0..v.len() {
+        if w > 0 && v[r].0 < v[w - 1].1 {
             continue;
         }
-        out.push(r);
+        v[w] = v[r];
+        w += 1;
     }
-    out
+    v.truncate(w);
+    v
 }
 
-/// Same-length copy of `t` with comments and verbatim bodies blanked.
-fn mask(t: &str) -> Vec<u8> {
+/// Same-length view of `t` with comments and verbatim bodies blanked (borrowed when nothing is blanked).
+fn mask(t: &str) -> Cow<'_, [u8]> {
+    mask_with(t, &dead_ranges(t))
+}
+
+fn mask_with<'a>(t: &'a str, dead: &[(usize, usize, Dead)]) -> Cow<'a, [u8]> {
+    if dead.is_empty() {
+        return Cow::Borrowed(t.as_bytes());
+    }
     let mut m = t.as_bytes().to_vec();
-    for (a, b, _) in dead_ranges(t) {
+    for &(a, b, _) in dead {
         m[a..b].fill(b' ');
     }
-    m
+    Cow::Owned(m)
 }
 
 /// Remove `%` comments and `comment` environments (verbatim bodies untouched). Comment-only lines vanish entirely.
-fn strip_comments(t: &str) -> std::borrow::Cow<'_, str> {
+fn strip_comments(t: &str) -> Cow<'_, str> {
     if !t.contains('%') && !t.contains("\\begin{comment}") && !t.contains("\\iffalse") && !t.contains("\\iftrue") {
-        return std::borrow::Cow::Borrowed(t);
+        return Cow::Borrowed(t);
+    }
+    let dead = dead_ranges(t);
+    if !dead.iter().any(|r| r.2 == Dead::Comment) {
+        return Cow::Borrowed(t);
     }
     let b = t.as_bytes();
     let mut out = String::with_capacity(t.len());
     let mut last = 0;
-    for (a, e, kind) in dead_ranges(t) {
+    for (a, e, kind) in dead {
         if kind != Dead::Comment {
             continue;
         }
@@ -370,7 +480,7 @@ fn strip_comments(t: &str) -> std::borrow::Cow<'_, str> {
         }
     }
     out.push_str(&t[last..]);
-    std::borrow::Cow::Owned(out)
+    Cow::Owned(out)
 }
 
 // ---------------------------------------------------------------- scanning helpers
@@ -527,19 +637,23 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-fn scan<'a>(t: &'a str, m: &[u8]) -> Scan<'a> {
+/// Collect structure events and definitions from the masked source; `next(i)` gives the first backslash of
+/// `m` at or after `i`.
+fn scan<'a>(t: &'a str, m: &[u8], mut next: impl FnMut(usize) -> Option<usize>) -> Scan<'a> {
     let n = m.len();
     let mut sc = Scan::default();
+    sc.evs.reserve(n / 1024 + 16);
     let mut i = 0;
     while i < n {
-        match m[i..].iter().position(|&c| c == b'\\') {
-            Some(p) => i += p + 1,
+        match next(i) {
+            Some(p) => i = p + 1,
             None => break,
         }
         if i >= n {
             break;
         }
-        if !m[i].is_ascii_alphabetic() {
+        // first letters of every command handled below; other names are skipped unread
+        if !matches!(m[i], b'a'..=b'e' | b'g' | b'n' | b'p' | b'r' | b's' | b'x' | b'D' | b'N' | b'P' | b'R') {
             i += 1;
             continue;
         }
@@ -700,46 +814,74 @@ impl Num {
     }
     /// Step the counters for a heading and return its id.
     fn head(&mut self, raw: u8, star: bool) -> String {
+        let mut id = String::with_capacity(12);
+        self.head_into(raw, star, &mut id);
+        id
+    }
+    /// `head`, replacing the contents of `id`.
+    fn head_into(&mut self, raw: u8, star: bool, id: &mut String) {
+        id.clear();
         if star {
             self.unnum += 1;
-            return format!("s{}", self.unnum);
-        }
-        if raw == 0 {
+            let _ = write!(id, "s{}", self.unnum);
+        } else if raw == 0 {
             self.parts += 1;
-            return format!("P{}", self.parts);
+            let _ = write!(id, "P{}", self.parts);
+        } else {
+            let r = raw as usize;
+            self.c[r] += 1;
+            self.c[r + 1..].fill(0);
+            self.prefix_into(r, id);
         }
-        let r = raw as usize;
-        self.c[r] += 1;
-        self.c[r + 1..].fill(0);
-        self.prefix(r)
     }
     fn appendix(&mut self) {
         self.app = true;
         self.c[self.top..].fill(0);
     }
     /// Number string of the current counters from the top level down to `r`.
-    fn prefix(&self, r: usize) -> String {
-        let mut s = String::new();
+    fn prefix_into(&self, r: usize, s: &mut String) {
+        let first = s.len();
         for k in self.top.min(r)..=r {
-            if !s.is_empty() {
+            if s.len() > first {
                 s.push('.');
             }
             let n = self.c[k];
             if self.app && k == self.top && (1..=26).contains(&n) {
                 s.push((b'A' + n as u8 - 1) as char);
             } else {
-                s.push_str(&n.to_string());
+                let _ = write!(s, "{n}");
             }
         }
-        s
     }
 }
 
 // ---------------------------------------------------------------- outline
 
-pub fn outline(tex: &str) -> Vec<Section> {
-    let m = mask(tex);
-    let sc = scan(tex, &m);
+/// Outline, theorem-like items and bibliography of `tex`, sharing one mask and one event scan.
+pub fn analyze(tex: &str) -> (Vec<Section>, Vec<Item>, Vec<Ref>) {
+    let hits = hit_positions(tex.as_bytes());
+    let dead = dead_ranges_by(tex, hit_walker(&hits));
+    let m = mask_with(tex, &dead);
+    let sc = scan(tex, &m, backslash_walker(&hits, &m));
+    (outline_of(tex, &sc), items_of(tex, &m, &sc), bib_refs(tex, &m, backslash_walker(&hits, &m)))
+}
+
+#[cfg(test)]
+fn outline(tex: &str) -> Vec<Section> {
+    analyze(tex).0
+}
+
+#[cfg(test)]
+fn items(tex: &str) -> Vec<Item> {
+    analyze(tex).1
+}
+
+#[cfg(test)]
+fn refs(tex: &str) -> Vec<Ref> {
+    analyze(tex).2
+}
+
+fn outline_of(tex: &str, sc: &Scan) -> Vec<Section> {
     let mut num = Num::new(&sc.evs);
     let mut present = [false; 5];
     for e in &sc.evs {
@@ -764,8 +906,9 @@ pub fn outline(tex: &str) -> Vec<Section> {
             _ => None,
         })
         .unwrap_or(tex.len());
-    let mut secs: Vec<Section> = Vec::new();
-    let mut raws: Vec<u8> = Vec::new();
+    let heads = sc.evs.iter().filter(|e| matches!(e, Ev::Head { .. })).count();
+    let mut secs: Vec<Section> = Vec::with_capacity(heads);
+    let mut raws: Vec<u8> = Vec::with_capacity(heads);
     let mut open: Vec<usize> = Vec::new();
     for e in &sc.evs {
         match e {
@@ -830,27 +973,27 @@ fn kind_of_label(label: &str) -> Option<Kind> {
         .find_map(|w| kind_word(&w.to_lowercase()))
 }
 
-fn kind_label(k: Kind, env: &str) -> String {
-    match k {
-        Kind::Problem => "Problem".into(),
-        Kind::Conjecture => "Conjecture".into(),
-        Kind::Question => "Question".into(),
-        Kind::Exercise => "Exercise".into(),
-        Kind::Theorem => "Theorem".into(),
-        Kind::Lemma => "Lemma".into(),
-        Kind::Proposition => "Proposition".into(),
-        Kind::Corollary => "Corollary".into(),
-        Kind::Definition => "Definition".into(),
-        Kind::Remark => "Remark".into(),
-        Kind::Example => "Example".into(),
-        Kind::Claim => "Claim".into(),
-        Kind::Other => capitalize(env),
-    }
+fn kind_label(k: Kind, env: &str) -> Cow<'static, str> {
+    Cow::Borrowed(match k {
+        Kind::Problem => "Problem",
+        Kind::Conjecture => "Conjecture",
+        Kind::Question => "Question",
+        Kind::Exercise => "Exercise",
+        Kind::Theorem => "Theorem",
+        Kind::Lemma => "Lemma",
+        Kind::Proposition => "Proposition",
+        Kind::Corollary => "Corollary",
+        Kind::Definition => "Definition",
+        Kind::Remark => "Remark",
+        Kind::Example => "Example",
+        Kind::Claim => "Claim",
+        Kind::Other => return Cow::Owned(capitalize(env)),
+    })
 }
 
-struct EnvInfo {
+struct EnvInfo<'a> {
     ctr: Option<usize>,
-    label: String,
+    label: Cow<'a, str>,
     kind: Kind,
 }
 
@@ -858,41 +1001,55 @@ struct EnvInfo {
 /// The typeset part of a source: between `\begin{document}` and the real `\end{document}` (comments and
 /// verbatim examples do not count); whole text when there are no markers.
 pub fn body(tex: &str) -> &str {
-    let m = mask(tex);
-    let start = find_sub(&m, 0, b"\\begin{document}").map_or(0, |p| p + 16);
-    let end = find_sub(&m, start, b"\\end{document}").unwrap_or(tex.len());
+    let dead = dead_ranges(tex);
+    let b = tex.as_bytes();
+    // a marker counts only when no byte of it lies in a comment or verbatim body
+    let live = |from: usize, pat: &[u8]| {
+        let mut i = from;
+        while let Some(p) = find_sub(b, i, pat) {
+            let k = dead.partition_point(|r| r.1 <= p);
+            if dead.get(k).is_none_or(|r| r.0 >= p + pat.len()) {
+                return Some(p);
+            }
+            i = p + 1;
+        }
+        None
+    };
+    let start = live(0, b"\\begin{document}").map_or(0, |p| p + 16);
+    let end = live(start, b"\\end{document}").unwrap_or(tex.len());
     &tex[start..end]
 }
 
 /// Bibliography entries (`\bibitem`, including an inlined .bbl) as references.
-pub fn refs(tex: &str) -> Vec<Ref> {
+/// `next(i)` gives the first backslash of `full` at or after `i`.
+fn bib_refs(tex: &str, full: &[u8], mut next: impl FnMut(usize) -> Option<usize>) -> Vec<Ref> {
     // like outline/items, nothing after \end{document} is typeset
-    let full = mask(tex);
-    let end = find_sub(&full, 0, b"\\end{document}").unwrap_or(tex.len());
-    let tex = &tex[..end];
-    let m = full[..end].to_vec();
-    let mut starts = Vec::new();
+    let (mut starts, mut closes, mut end) = (Vec::new(), Vec::new(), full.len());
     let mut i = 0;
-    while let Some(p) = find_sub(&m, i, b"\\bibitem") {
-        starts.push(p);
-        i = p + 8;
+    while let Some(p) = next(i) {
+        let r = &full[p..];
+        if r.starts_with(b"\\end{document}") {
+            end = p;
+            break;
+        } else if r.starts_with(b"\\bibitem") {
+            starts.push(p);
+        } else if r.starts_with(b"\\end{thebibliography}") {
+            closes.push(p);
+        }
+        i = p + 1;
     }
-    let mut out = Vec::new();
-    // closing offsets once (not one forward scan per entry)
-    let mut closes = Vec::new();
-    let mut at = 0;
-    while let Some(p) = find_sub(&m, at, b"\\end{thebibliography}") {
-        closes.push(p);
-        at = p + 1;
-    }
+    let tex = &tex[..end];
+    let m = &full[..end];
+    let mut out = Vec::with_capacity(starts.len());
+    let mut links = String::new();
     for (k, &s) in starts.iter().enumerate() {
         // an entry ends at the next \bibitem or at the end of its own bibliography
         let end_all = closes.get(closes.partition_point(|&c| c < s)).copied().unwrap_or(tex.len());
         let mut j = s + 8;
-        if let Some((_, _, nx)) = opt(&m, j) {
+        if let Some((_, _, nx)) = opt(m, j) {
             j = nx;
         }
-        let Some((_, _, body)) = group(&m, j, 200) else { continue };
+        let Some((_, _, body)) = group(m, j, 200) else { continue };
         let e = starts.get(k + 1).copied().unwrap_or(end_all).min(end_all);
         if body >= e {
             continue;
@@ -901,14 +1058,14 @@ pub fn refs(tex: &str) -> Vec<Ref> {
         let text = clean_inline(raw);
         if !text.is_empty() {
             // identifiers often live only in \href{https://doi.org/..}{label} / \url{..} targets
-            let mut links = String::new();
+            links.clear();
             let rm = &m[body..e];
             for cmd in [&b"\\href"[..], &b"\\url"[..]] {
                 let mut from = 0;
                 while let Some(p) = find_sub(rm, from, cmd) {
                     let after = p + cmd.len();
                     if let Some((a, z, nx)) = group(rm, after, 2000) {
-                        links.push_str(&raw[a..z]); // masked copy decides where the command is, raw gives the text
+                        push_unescaped(&mut links, &raw[a..z]); // masked copy decides where the command is, raw gives the text
                         links.push(' ');
                         from = nx;
                     } else {
@@ -916,18 +1073,34 @@ pub fn refs(tex: &str) -> Vec<Ref> {
                     }
                 }
             }
-            let links = links.replace("\\_", "_").replace("\\%", "%").replace("\\&", "&").replace("\\#", "#");
             out.push(crate::html::make_ref(out.len() as u32 + 1, "", text, &links));
         }
     }
     out
 }
 
-pub fn items(tex: &str) -> Vec<Item> {
-    let m = mask(tex);
-    let sc = scan(tex, &m);
+/// Append `s` with `\_`, `\%`, `\&` and `\#` unescaped.
+fn push_unescaped(out: &mut String, s: &str) {
+    let mut rest = s;
+    while let Some(p) = rest.find('\\') {
+        out.push_str(&rest[..p]);
+        match rest.as_bytes().get(p + 1) {
+            Some(&c) if matches!(c, b'_' | b'%' | b'&' | b'#') => {
+                out.push(c as char);
+                rest = &rest[p + 2..];
+            }
+            _ => {
+                out.push('\\');
+                rest = &rest[p + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+}
+
+fn items_of(tex: &str, m: &[u8], sc: &Scan) -> Vec<Item> {
     let mut ctrs: Vec<(u32, Option<u8>)> = Vec::new();
-    let mut envs: HashMap<&str, EnvInfo> = HashMap::new();
+    let mut envs: HashMap<&str, EnvInfo<'_>> = HashMap::new();
     for d in &sc.defs {
         let kind = kind_of_label(&d.label).or_else(|| builtin_kind(d.env)).unwrap_or(Kind::Other);
         let shared = d.share.and_then(|s| envs.get(s)).and_then(|e| e.ctr);
@@ -942,7 +1115,7 @@ pub fn items(tex: &str) -> Vec<Item> {
             ctrs.push((0, d.within));
             Some(ctrs.len() - 1)
         };
-        let label = if d.label.is_empty() { capitalize(d.env) } else { d.label.clone() };
+        let label = if d.label.is_empty() { Cow::Owned(capitalize(d.env)) } else { Cow::Borrowed(d.label.as_str()) };
         envs.insert(d.env, EnvInfo { ctr, label, kind });
     }
     for (a, b) in &sc.within {
@@ -983,11 +1156,12 @@ pub fn items(tex: &str) -> Vec<Item> {
     let mut num = Num::new(&sc.evs);
     let mut cur = String::new();
     let mut out = Vec::new();
+    let mut scratch = Out::with_capacity(0);
     for (k, e) in sc.evs.iter().enumerate() {
         match e {
             Ev::Appendix => num.appendix(),
             Ev::Head { raw, star, .. } => {
-                cur = num.head(*raw, *star);
+                num.head_into(*raw, *star, &mut cur);
                 if !star && *raw >= 1 {
                     for c in ctrs.iter_mut() {
                         if c.1.is_some_and(|w| *raw <= w) {
@@ -1001,47 +1175,56 @@ pub fn items(tex: &str) -> Vec<Item> {
                     Some(b) => (b, true),
                     None => (*name, false),
                 };
-                let (label, kind, ctr) = if let Some(i) = envs.get(*name).or_else(|| envs.get(base)) {
-                    (i.label.clone(), i.kind, i.ctr)
-                } else if let Some(kd) = builtin_kind(base) {
-                    (kind_label(kd, base), kd, None)
-                } else {
-                    continue;
-                };
+                let (label, kind, ctr): (Cow<str>, Kind, Option<usize>) =
+                    if let Some(i) = envs.get(*name).or_else(|| envs.get(base)) {
+                        (Cow::Borrowed(&*i.label), i.kind, i.ctr)
+                    } else if let Some(kd) = builtin_kind(base) {
+                        (kind_label(kd, base), kd, None)
+                    } else {
+                        continue;
+                    };
+                // (count, `within` level) of the counter this item stepped
                 let number = match ctr {
                     Some(c) if !star => {
                         ctrs[c].0 += 1;
-                        let n = ctrs[c].0;
-                        Some(match ctrs[c].1 {
-                            Some(w) => format!("{}.{}", num.prefix(w as usize), n),
-                            None => n.to_string(),
-                        })
+                        Some((ctrs[c].0, ctrs[c].1))
                     }
                     _ => None,
                 };
                 let Some(Ev::End { pos: end, .. }) = sc.evs.get(pair[k]) else { continue };
                 let mut b0 = *after;
                 let mut title = String::new();
-                if let Some((a, e, nx)) = opt(&m, b0) {
+                if let Some((a, e, nx)) = opt(m, b0) {
                     if e < *end {
-                        title = clean_inline(tex.get(a..e).unwrap_or(""));
+                        title = scratch.inline(tex.get(a..e).unwrap_or(""));
                         b0 = nx;
                     }
                 }
                 let text = clean(tex.get(b0..*end).unwrap_or(""));
-                if text.is_empty() {
+                let keep = !text.is_empty();
+                let mut full = String::new();
+                if keep {
+                    full.reserve(label.len() + title.len() + 16);
+                    full.push_str(&label);
+                    if let Some((n, within)) = number {
+                        full.push(' ');
+                        if let Some(w) = within {
+                            num.prefix_into(w as usize, &mut full);
+                            full.push('.');
+                        }
+                        let _ = write!(full, "{n}");
+                    }
+                    if !title.is_empty() {
+                        full.push_str(" (");
+                        full.push_str(&title);
+                        full.push(')');
+                    }
+                }
+                scratch.pool = title;
+                if !keep {
                     continue;
                 }
-                let mut label = label;
-                if let Some(n) = number {
-                    label.push(' ');
-                    label.push_str(&n);
-                }
-                if !title.is_empty() {
-                    label.push_str(" (");
-                    label.push_str(&title);
-                    label.push(')');
-                }
+                let label = full;
                 out.push(Item { kind, label, sec: cur.clone(), text });
             }
             Ev::End { .. } => {}
@@ -1054,9 +1237,25 @@ pub fn items(tex: &str) -> Vec<Item> {
 
 struct Out {
     s: String,
+    /// spare buffer reused by `inline`, so repeated headings/titles do not allocate each time
+    pool: String,
 }
 
 impl Out {
+    fn with_capacity(n: usize) -> Out {
+        Out { s: String::with_capacity(n), pool: String::new() }
+    }
+    /// `clean` of `s` with newlines turned into spaces. Hand the result back through `self.pool` when done.
+    fn inline(&mut self, s: &str) -> String {
+        let mut t = Out { s: std::mem::take(&mut self.pool), pool: String::new() };
+        t.s.clear();
+        run(s, &mut t);
+        let mut b = t.s.into_bytes();
+        for x in b.iter_mut().filter(|x| **x == b'\n') {
+            *x = b' ';
+        }
+        String::from_utf8(b).unwrap_or_default()
+    }
     fn space(&mut self) {
         if !matches!(self.s.as_bytes().last(), None | Some(b' ') | Some(b'\n')) {
             self.s.push(' ');
@@ -1072,11 +1271,7 @@ impl Out {
 }
 
 fn clean_inline(s: &str) -> String {
-    let mut b = clean(s).into_bytes();
-    for x in b.iter_mut().filter(|x| **x == b'\n') {
-        *x = b' ';
-    }
-    String::from_utf8(b).unwrap_or_default()
+    Out::with_capacity(0).inline(s)
 }
 
 const MATH_ENVS: &[&str] = &[
@@ -1086,10 +1281,17 @@ const MATH_ENVS: &[&str] = &[
 
 /// Light LaTeX to text cleanup: math stays as `$..$` / `$$..$$`, markup is dropped.
 pub fn clean(tex: &str) -> String {
+    let mut o = Out::with_capacity(tex.len());
+    run(tex, &mut o);
+    o.s
+}
+
+/// Clean `tex` into `o.s`, which must be empty.
+fn run(tex: &str, o: &mut Out) {
     let s = strip_comments(tex);
     let b = s.as_bytes();
     let n = b.len();
-    let mut o = Out { s: String::with_capacity(n) };
+    o.s.reserve(n);
     let mut i = 0;
     while i < n {
         match b[i] {
@@ -1132,7 +1334,7 @@ pub fn clean(tex: &str) -> String {
                     Some(e) if dbl => {
                         o.space();
                         o.s.push_str("$$");
-                        math_copy(&s[st..e], &mut o);
+                        math_copy(&s[st..e], o);
                         o.s.push_str("$$");
                         i = e + 2;
                         if !matches!(b.get(i), Some(b'.') | Some(b',') | Some(b';')) {
@@ -1141,7 +1343,7 @@ pub fn clean(tex: &str) -> String {
                     }
                     Some(e) => {
                         o.s.push('$');
-                        math_copy(&s[st..e], &mut o);
+                        math_copy(&s[st..e], o);
                         o.s.push('$');
                         i = e + 1;
                     }
@@ -1151,11 +1353,17 @@ pub fn clean(tex: &str) -> String {
                     }
                 }
             }
-            b'\\' => i = command(&s, i, &mut o),
+            b'\\' => i = command(&s, i, o),
             _ => {
-                let mut j = i;
-                while j < n && !is_special(b[j]) {
+                // copy plain text in one go; a lone space after a plain byte is what `space` would emit anyway
+                let mut j = i + 1;
+                while j + 1 < n && !STOP[b[j] as usize * 2 + IS_WS[b[j + 1] as usize] as usize] {
                     j += 1;
+                }
+                if j + 1 >= n {
+                    while j < n && !SPECIAL[b[j] as usize] {
+                        j += 1;
+                    }
                 }
                 o.s.push_str(&s[i..j]);
                 i = j;
@@ -1166,12 +1374,40 @@ pub fn clean(tex: &str) -> String {
     o.s.truncate(t);
     let lead = o.s.len() - o.s.trim_start_matches('\n').len();
     o.s.drain(..lead);
-    o.s
 }
 
-fn is_special(c: u8) -> bool {
-    matches!(c, b' ' | b'\t' | b'\r' | b'\n' | b'{' | b'}' | b'~' | b'`' | b'\'' | b'$' | b'\\')
-}
+/// `[byte * 2 + (next byte is whitespace)]`: ends a plain-text run. A space ends it only before more
+/// whitespace; otherwise it is copied as-is, which is what `Out::space` would emit.
+static STOP: [bool; 512] = {
+    let mut t = [false; 512];
+    let mut c = 0;
+    while c < 256 {
+        t[c * 2] = SPECIAL[c] && c != b' ' as usize;
+        t[c * 2 + 1] = SPECIAL[c];
+        c += 1;
+    }
+    t
+};
+static IS_WS: [bool; 256] = {
+    let mut t = [false; 256];
+    let sp = b" \t\r\n";
+    let mut i = 0;
+    while i < sp.len() {
+        t[sp[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+static SPECIAL: [bool; 256] = {
+    let mut t = [false; 256];
+    let sp = b" \t\r\n{}~`'$\\";
+    let mut i = 0;
+    while i < sp.len() {
+        t[sp[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
 
 fn find_dollar(b: &[u8], mut i: usize, dbl: bool) -> Option<usize> {
     while i < b.len() {
@@ -1218,11 +1454,15 @@ fn math_copy(body: &str, o: &mut Out) {
             }
             b'\\' => {
                 let rest = &body[i..];
-                let skip = ["\\label", "\\nonumber", "\\notag"].iter().find_map(|p| {
-                    let after = rest.get(p.len()..)?;
-                    (rest.starts_with(p) && !after.starts_with(|c: char| c.is_ascii_alphabetic()))
-                        .then_some(p.len())
-                });
+                let skip = if matches!(b.get(i + 1), Some(b'l' | b'n')) {
+                    ["\\label", "\\nonumber", "\\notag"].iter().find_map(|p| {
+                        let after = rest.get(p.len()..)?;
+                        (rest.starts_with(p) && !after.starts_with(|c: char| c.is_ascii_alphabetic()))
+                            .then_some(p.len())
+                    })
+                } else {
+                    None
+                };
                 if let Some(l) = skip {
                     flush!(i);
                     let mut j = i + l;
@@ -1321,7 +1561,9 @@ fn command(s: &str, i: usize, o: &mut Out) -> usize {
             o.newline();
             o.s.push_str("- ");
             if let Some((a, e, nx)) = opt(b, i) {
-                o.s.push_str(&clean_inline(&s[a..e]));
+                let t = o.inline(&s[a..e]);
+                o.s.push_str(&t);
+                o.pool = t;
                 o.space();
                 i = nx;
             }
@@ -1333,7 +1575,7 @@ fn command(s: &str, i: usize, o: &mut Out) -> usize {
                 j = nx;
             }
             if let Some((a, e, nx)) = group(b, j, TITLE_LIM) {
-                let title = clean_inline(&s[a..e]);
+                let title = o.inline(&s[a..e]);
                 match name {
                     "part" | "chapter" => {
                         o.newline();
@@ -1354,6 +1596,7 @@ fn command(s: &str, i: usize, o: &mut Out) -> usize {
                     _ => o.space(),
                 }
                 o.s.push_str(&title);
+                o.pool = title;
                 if matches!(name, "paragraph" | "subparagraph") {
                     o.space();
                 } else {
@@ -1477,10 +1720,7 @@ fn env_begin(s: &str, i: usize, o: &mut Out) -> usize {
     let Some((a, e, mut i)) = group(b, i, 100) else { return i };
     let name = s[a..e].trim();
     let base = name.trim_end_matches('*');
-    let end_of = |from: usize| {
-        let pat = format!("\\end{{{name}}}");
-        find_sub(b, from, pat.as_bytes()).map(|p| (p, p + pat.len()))
-    };
+    let end_of = |from: usize| find_end(b, from, name.as_bytes());
     if is_verb_env(name.as_bytes()) {
         if let Some((p, q)) = end_of(i) {
             o.newline();
@@ -1509,7 +1749,7 @@ fn env_begin(s: &str, i: usize, o: &mut Out) -> usize {
     o.newline();
     let mut title = None;
     if let Some((a, e, nx)) = opt(b, i) {
-        title = Some(clean_inline(&s[a..e]));
+        title = Some(o.inline(&s[a..e]));
         i = nx;
     }
     match base {
@@ -1534,6 +1774,9 @@ fn env_begin(s: &str, i: usize, o: &mut Out) -> usize {
                 o.s.push_str(". ");
             }
         }
+    }
+    if let Some(t) = title {
+        o.pool = t;
     }
     i
 }
@@ -1583,6 +1826,9 @@ fn compose(acc: char, base: char) -> Option<char> {
 // ---------------------------------------------------------------- flatten
 
 fn norm_path(p: &str) -> String {
+    if is_normal(p) {
+        return p.to_string();
+    }
     let mut v: Vec<&str> = Vec::new();
     for seg in p.split('/') {
         match seg {
@@ -1600,45 +1846,58 @@ fn dir_of(p: &str) -> &str {
     p.rsplit_once('/').map(|x| x.0).unwrap_or("")
 }
 
-fn join_path(dir: &str, name: &str) -> String {
-    if dir.is_empty() {
-        norm_path(name)
-    } else {
-        norm_path(&format!("{dir}/{name}"))
-    }
-}
-
 struct Flat<'a> {
     /// `\includeonly{a,b}` allow-list (names without extension); `None` = include everything.
     only: Option<Vec<String>>,
     files: &'a [(String, String)],
-    stripped: Vec<String>,
+    stripped: Vec<Cow<'a, str>>,
     index: HashMap<String, usize>,
     base: String,
     main_stem: String,
+    /// scratch path buffer for `resolve`
+    path: std::cell::RefCell<String>,
 }
 
 impl Flat<'_> {
+    /// Index of the file at `dir/name[.ext]` after normalisation.
+    fn lookup(&self, dir: &str, name: &str, ext: Option<&str>) -> Option<usize> {
+        let mut buf = self.path.borrow_mut();
+        buf.clear();
+        if !dir.is_empty() {
+            buf.push_str(dir);
+            buf.push('/');
+        }
+        buf.push_str(name);
+        if let Some(e) = ext {
+            buf.push('.');
+            buf.push_str(e);
+        }
+        let hit = if is_normal(&buf) { self.index.get(buf.as_str()) } else { self.index.get(&norm_path(&buf)) };
+        hit.copied()
+    }
+
     /// Find a file for an \input-like argument: relative to the main dir, the including file, or by basename.
     fn resolve(&self, name: &str, cur_dir: &str, ext: &str) -> Option<usize> {
         let name = name.trim();
         if name.is_empty() {
             return None;
         }
-        let with_ext = format!("{name}.{ext}");
-        for cand in [name, with_ext.as_str()] {
+        for e in [None, Some(ext)] {
             for dir in ["", self.base.as_str(), cur_dir] {
-                if let Some(&k) = self.index.get(&join_path(dir, cand)) {
+                if let Some(k) = self.lookup(dir, name, e) {
                     return Some(k);
                 }
             }
         }
-        let base = |p: &str| p.rsplit('/').next().unwrap_or(p).to_string();
-        let (a, b) = (base(name), base(&with_ext));
-        let mut hits = self.files.iter().enumerate().filter(|(_, (n, _))| {
-            let f = base(n);
-            f == a || f == b
-        });
+        fn base(p: &str) -> &str {
+            p.rsplit('/').next().unwrap_or(p)
+        }
+        let a = base(name);
+        // basename of `name.ext`
+        let hit = |f: &str| {
+            f == a || f.strip_prefix(a).and_then(|r| r.strip_prefix('.')).is_some_and(|r| r == ext)
+        };
+        let mut hits = self.files.iter().enumerate().filter(|(_, (n, _))| hit(base(n)));
         match (hits.next(), hits.next()) {
             (Some((k, _)), None) => Some(k),
             _ => None,
@@ -1648,24 +1907,34 @@ impl Flat<'_> {
     fn expand(&self, idx: usize, text: &str, depth: usize, stack: &mut Vec<usize>, out: &mut String) {
         stack.push(idx);
         // `\endinput` stops reading this file (after the rest of its line)
-        let text = {
-            let m0 = mask(text);
-            match find_sub(&m0, 0, b"\\endinput") {
-                Some(p) => &text[..find_byte(&m0, p, b'\n').unwrap_or(text.len())],
-                None => text,
+        let mut hits = hit_positions(text.as_bytes());
+        let dead = dead_ranges_by(text, hit_walker(&hits));
+        let m0 = mask_with(text, &dead);
+        let endinput = {
+            let mut walk = backslash_walker(&hits, &m0);
+            let mut at = 0;
+            loop {
+                match walk(at) {
+                    Some(p) if m0[p..].starts_with(b"\\endinput") => break Some(p),
+                    Some(p) => at = p + 1,
+                    None => break None,
+                }
             }
         };
-        let m = mask(text);
+        let (text, m) = match endinput {
+            Some(p) => {
+                let text = &text[..find_byte(&m0, p, b'\n').unwrap_or(text.len())];
+                hits = hit_positions(text.as_bytes());
+                (text, mask(text))
+            }
+            None => (text, m0),
+        };
         let n = m.len();
         let cur_dir = dir_of(&self.files[idx].0);
         let (mut last, mut i) = (0, 0);
-        while i < n {
-            if m[i] != b'\\' {
-                i += 1;
-                continue;
-            }
-            let bs = i;
-            i += 1;
+        let mut walk = backslash_walker(&hits, &m);
+        while let Some(bs) = walk(i) {
+            i = bs + 1;
             let s = i;
             while i < n && m[i].is_ascii_alphabetic() {
                 i += 1;
@@ -1691,8 +1960,8 @@ impl Flat<'_> {
             };
             if is_include {
                 if let Some(only) = &self.only {
-                    let stem = |x: &str| x.trim().trim_end_matches(".tex").to_string();
-                    if !only.iter().any(|o| *o == stem(arg)) {
+                    let arg_stem = arg.trim().trim_end_matches(".tex");
+                    if !only.iter().any(|o| o == arg_stem) {
                         out.push_str(&text[last..bs]);
                         last = next;
                         i = next;
@@ -1711,7 +1980,7 @@ impl Flat<'_> {
             if depth >= MAX_DEPTH || stack.contains(&t) || out.len() > MAX_TOTAL {
                 continue;
             }
-            let mut body = self.stripped[t].as_str();
+            let mut body: &str = &self.stripped[t];
             if subfile {
                 if let (Some(a), Some(e)) = (body.find("\\begin{document}"), body.rfind("\\end{document}")) {
                     if a + 16 <= e {
@@ -1741,7 +2010,7 @@ pub fn flatten(files: &[(String, String)]) -> Option<String> {
     if texs.is_empty() {
         return None;
     }
-    let stripped: Vec<String> = files.iter().map(|(_, c)| strip_comments(c).into_owned()).collect();
+    let stripped: Vec<Cow<str>> = files.iter().map(|(_, c)| strip_comments(c)).collect();
     let pick = |pats: &[&str]| -> Vec<usize> {
         texs.iter().copied().filter(|&k| pats.iter().all(|p| stripped[k].contains(p))).collect()
     };
@@ -1792,8 +2061,9 @@ pub fn flatten(files: &[(String, String)]) -> Option<String> {
             n.rsplit_once('.').map(|x| x.0.to_string()).unwrap_or(n)
         },
         stripped,
+        path: Default::default(),
     };
-    let mut out = String::new();
+    let mut out = String::with_capacity(fl.stripped.iter().map(|s| s.len()).sum::<usize>().min(MAX_TOTAL));
     fl.expand(main, &fl.stripped[main], 0, &mut Vec::new(), &mut out);
     Some(out)
 }
@@ -2256,6 +2526,52 @@ mod tests {
     }
 
     // ------------------------------------------------------------ robustness / perf
+
+    #[test]
+    fn byte_search_helpers_cover_every_offset() {
+        let mut t = vec![b'x'; 70];
+        t[63] = b'%';
+        t[64] = b'\\';
+        for from in 0..=70 {
+            let want = |c: &[u8]| (from..70).find(|&i| c.contains(&t[i]));
+            assert_eq!(find_either(&t, from, b'%', b'\\'), want(b"%\\"), "from {from}");
+            assert_eq!(find_byte(&t, from, b'\\'), want(b"\\"), "from {from}");
+        }
+        assert_eq!(find_byte(&t, 71, b'x'), None);
+        let b = b"\\begin{verbatim}\\end{verbatim*}\\end{verbatim}!";
+        assert_eq!(find_end(b, 0, b"verbatim"), Some((31, 45)));
+        assert_eq!(find_end(b, 0, b"verbatim*"), Some((16, 31)));
+        assert_eq!(find_end(b, 0, b"nope"), None);
+    }
+
+    #[test]
+    fn push_unescaped_unescapes_only_the_four_link_escapes() {
+        let mut s = String::from(">");
+        push_unescaped(&mut s, r"a\_b\%c\&d\#e\\f\x\");
+        assert_eq!(s, ">a_b%c&d#e\\\\f\\x\\");
+    }
+
+    #[test]
+    fn normal_paths_are_recognised() {
+        for p in ["a", "a/b.tex", "a.b/c"] {
+            assert!(is_normal(p), "{p}");
+            assert_eq!(norm_path(p), p);
+        }
+        for p in ["", "/a", "a/", "a//b", "./a", "a/./b", "a/../b", "a\\b"] {
+            assert!(!is_normal(p), "{p}");
+        }
+        assert_eq!(norm_path("./a//b/../c/"), "a/c");
+    }
+
+    #[test]
+    fn unpack_ignores_a_lying_gzip_size_hint() {
+        let src = "\\documentclass{article}\n".repeat(50);
+        let mut g = gz(src.as_bytes());
+        assert_eq!(unpack(&g).unwrap()[0].1, src);
+        let n = g.len();
+        g[n - 4..].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(unpack(&g).is_err());
+    }
 
     #[test]
     fn no_panic_on_truncation_and_garbage() {

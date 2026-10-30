@@ -303,9 +303,7 @@ async fn load_tex(net: &Net, id: &str) -> Result<Option<DocData>, String> {
     let Some(b) = net.get_bytes(&format!("https://arxiv.org/e-print/{id}"), Ttl::Doc).await? else { return Ok(None) };
     let files = tex::unpack(&b)?;
     let Some(t) = tex::flatten(&files) else { return Ok(None) };
-    let sections = tex::outline(&t);
-    let items = tex::items(&t);
-    let refs = tex::refs(&t);
+    let (sections, items, refs) = tex::analyze(&t);
     Ok(Some(DocData { title: String::new(), text: t, sections, items, refs, is_tex: true }))
 }
 
