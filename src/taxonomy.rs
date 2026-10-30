@@ -10,12 +10,12 @@ static RAW: &str = include_str!("../data/cats.tsv");
 pub fn all() -> &'static [Cat] {
     static CATS: OnceLock<Vec<Cat>> = OnceLock::new();
     CATS.get_or_init(|| {
-        RAW.lines()
-            .filter_map(|l| {
-                let mut p = l.split('\t');
-                Some(Cat { id: p.next()?, name: p.next()? })
-            })
-            .collect()
+        let mut v = Vec::with_capacity(RAW.bytes().filter(|&b| b == b'\n').count() + 1);
+        v.extend(RAW.lines().filter_map(|l| {
+            let mut p = l.split('\t');
+            Some(Cat { id: p.next()?, name: p.next()? })
+        }));
+        v
     })
 }
 
@@ -105,20 +105,28 @@ static ALIASES: &[(&str, &[&str])] = &[
 
 const STOP: &[&str] = &["and", "of", "the", "in", "for", "to", "a", "on"];
 
-fn toks(s: &str) -> Vec<Vec<char>> {
-    let mut out = Vec::new();
-    let mut cur = Vec::new();
-    for ch in s.chars() {
+/// Calls `f` with each lowercase alphanumeric token of `s` (stop words skipped) until it returns false.
+fn each_tok(s: &str, cur: &mut Vec<char>, mut f: impl FnMut(&[char]) -> bool) -> bool {
+    cur.clear();
+    for ch in s.chars().chain(std::iter::once(' ')) {
         if ch.is_alphanumeric() {
             cur.extend(ch.to_lowercase());
         } else if !cur.is_empty() {
-            out.push(std::mem::take(&mut cur));
+            if !STOP.iter().any(|w| w.chars().eq(cur.iter().copied())) && !f(cur) {
+                return false;
+            }
+            cur.clear();
         }
     }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out.retain(|t| !STOP.iter().any(|w| w.chars().eq(t.iter().copied())));
+    true
+}
+
+fn toks(s: &str) -> Vec<Vec<char>> {
+    let mut out = Vec::new();
+    each_tok(s, &mut Vec::new(), |t| {
+        out.push(t.to_vec());
+        true
+    });
     out
 }
 
@@ -142,8 +150,15 @@ fn tok_eq(a: &[char], b: &[char]) -> bool {
     }
 }
 
-fn phrase_eq(q: &[Vec<char>], p: &[Vec<char>], fuzzy: bool) -> bool {
-    q.len() == p.len() && q.iter().zip(p).all(|(a, b)| if fuzzy { tok_eq(a, b) } else { a == b })
+/// `q` equals the tokens of `phrase` (token-wise exact, or within one edit when `fuzzy`).
+fn phrase_eq(q: &[Vec<char>], phrase: &str, fuzzy: bool, cur: &mut Vec<char>) -> bool {
+    let mut i = 0;
+    let all = each_tok(phrase, cur, |t| {
+        let hit = q.get(i).is_some_and(|a| if fuzzy { tok_eq(a, t) } else { a == t });
+        i += 1;
+        hit
+    });
+    all && i == q.len()
 }
 
 fn push_all(out: &mut Vec<String>, ids: impl IntoIterator<Item = impl Into<String>>) {
@@ -187,14 +202,15 @@ pub fn resolve(s: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut out = Vec::new();
+    let mut cur = Vec::new();
     for fuzzy in [false, true] {
         for (phrase, ids) in ALIASES {
-            if phrase_eq(&q, &toks(phrase), fuzzy) {
+            if phrase_eq(&q, phrase, fuzzy, &mut cur) {
                 push_all(&mut out, ids.iter().copied());
             }
         }
         for c in all() {
-            if phrase_eq(&q, &toks(c.name), fuzzy) {
+            if phrase_eq(&q, c.name, fuzzy, &mut cur) {
                 push_all(&mut out, [c.id]);
             }
         }
@@ -214,17 +230,28 @@ pub fn resolve(s: &str) -> Vec<String> {
     out
 }
 
+/// `hay.to_lowercase().contains(needle)` (`needle` already lowercase) without allocating for ASCII text.
+pub fn contains_lower(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        true
+    } else if hay.is_ascii() {
+        hay.as_bytes().windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+    } else {
+        hay.to_lowercase().contains(needle)
+    }
+}
+
 /// Compact listing for `arx cats [filter]`.
 ///
 /// Format: `arch: SUB Name | SUB Name ...` (id = `arch.SUB`), one archive per line; legacy
 /// single-id archives are `id Name` lines.
 pub fn list(filter: Option<&str>) -> String {
     let f = filter.map(|f| f.trim().to_lowercase()).filter(|f| !f.is_empty());
-    let mut out = String::new();
+    let mut out = String::with_capacity(if f.is_some() { 256 } else { 4608 });
     let mut open: Option<&str> = None;
     for c in all() {
         if let Some(f) = &f {
-            if !c.id.to_lowercase().contains(f.as_str()) && !c.name.to_lowercase().contains(f.as_str()) {
+            if !contains_lower(c.id, f) && !contains_lower(c.name, f) {
                 continue;
             }
         }
@@ -329,6 +356,13 @@ mod tests {
             assert!(r(s).is_empty(), "{s:?} -> {:?}", r(s));
         }
         assert!(r("日本語 combinatorics").is_empty());
+    }
+
+    #[test]
+    fn contains_lower_matches_str_contains() {
+        for (h, n) in [("Math.CO", ""), ("", ""), ("Math.CO", "co"), ("Math.CO", "x"), ("Ünï Math", "math"), ("ab", "abc")] {
+            assert_eq!(contains_lower(h, n), h.to_lowercase().contains(n), "{h:?} {n:?}");
+        }
     }
 
     #[test]

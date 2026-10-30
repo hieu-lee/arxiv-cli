@@ -1,6 +1,7 @@
 //! Dispatcher + batch executor: `a ; b` run concurrently, `a | b` chains papers into the next stage.
 
 use futures_util::future::join_all;
+use std::fmt::Write;
 use std::sync::Arc;
 
 use crate::args::{self, Args};
@@ -192,13 +193,18 @@ fn unwatch(a: &Args) -> Result<Out, String> {
 
 fn watches() -> Result<Out, String> {
     let w = store::load_watches()?;
-    let m = w.as_object().cloned().unwrap_or_default();
-    if m.is_empty() {
+    let Some(m) = w.as_object().filter(|m| !m.is_empty()) else {
         return Ok(text_out("no watches"));
+    };
+    let mut out = String::new();
+    for (k, v) in m {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let last = v["last"].as_str().filter(|s| !s.is_empty()).unwrap_or("never");
+        let _ = write!(out, "{k} [{last}] {}", v["q"].as_str().unwrap_or(""));
     }
-    Ok(text_out(
-        m.iter().map(|(k, v)| format!("{k} [{}] {}", v["last"].as_str().filter(|s| !s.is_empty()).unwrap_or("never"), v["q"].as_str().unwrap_or(""))).collect::<Vec<_>>().join("\n"),
-    ))
+    Ok(text_out(out))
 }
 
 /// First-run window for a watch that was never checked.
@@ -362,7 +368,19 @@ fn split_on<'a>(toks: &'a [String], sep: &str) -> Vec<&'a [String]> {
         }
     }
     v.push(&toks[start..]);
-    v.into_iter().filter(|s| !s.is_empty()).collect()
+    v.retain(|s| !s.is_empty());
+    v
+}
+
+/// Every stage (including those of nested `x` scripts) is a command that never touches the network.
+pub fn all_local(toks: &[String]) -> bool {
+    const LOCAL: &[&str] = &["cats", "tags", "venue", "watch", "unwatch", "watches", "cache", "help"];
+    split_on(toks, args::OP_SEMI).iter().all(|st| {
+        split_on(st, args::OP_PIPE).iter().all(|sg| match split_cmd(sg) {
+            ("x", rest) => args::tokenize(&script_text(rest)).is_ok_and(|t| all_local(&t)),
+            (c, _) => LOCAL.contains(&c),
+        })
+    })
 }
 
 /// `--qfile=PATH` as an outer option (the path may contain spaces) as opposed to a script that merely starts
@@ -451,17 +469,15 @@ pub fn load_qfiles(a: &Args) -> Result<(), String> {
 
 /// Run statements (`;`) concurrently, each a `|` chain. Returns (text, all_ok).
 pub async fn run_batch(net: &Arc<Net>, toks: &[String]) -> (String, bool, Vec<Cursor>) {
+    let stmts: Vec<Vec<&[String]>> = split_on(toks, args::OP_SEMI).into_iter().map(|st| split_on(st, args::OP_PIPE)).collect();
     // `x` is a batch runner, not a papers stage: keep pipelines inside one script
-    for stmt in split_on(toks, args::OP_SEMI) {
-        let stages = split_on(stmt, args::OP_PIPE);
+    for stages in &stmts {
         if stages.len() > 1 && stages.iter().any(|s| split_cmd(s).0 == "x") {
             return ("error: `x` cannot be piped; write the whole pipeline inside one x script".into(), false, Vec::new());
         }
     }
-    let stmts = split_on(toks, args::OP_SEMI);
     let multi = stmts.len() > 1;
-    let futs = stmts.iter().map(|st| async move {
-        let stages = split_on(st, args::OP_PIPE);
+    let futs = stmts.iter().map(|stages| async move {
         let mut input: Input = None;
         let mut text = String::new();
         let mut ok = true;
@@ -519,6 +535,30 @@ mod tests {
         assert_eq!(canonical("problems"), Some("prob"));
         assert_eq!(canonical("nope"), None);
     }
+    #[test]
+    fn local_commands_are_recognised() {
+        assert!(all_local(&t("cats math ; venue annals | tags ; help x")));
+        assert!(all_local(&["x".into(), "cats ; x \"tags\"".into()]));
+        assert!(!all_local(&t("cats ; get 2301.00001")));
+        assert!(!all_local(&t("search diffusion")));
+        assert!(!all_local(&t("alerts")));
+        assert!(!all_local(&["x".into(), "cats ; alerts".into()]));
+    }
+
+    #[test]
+    fn local_batches_finish_in_one_poll() {
+        use std::future::Future;
+        let net = Arc::new(Net::for_test(&std::env::temp_dir(), &[]));
+        let toks = t("cats math ; tags ; venue annals | cats ; help x ; x 'venue nature'");
+        let mut fut = std::pin::pin!(run_batch(&net, &toks));
+        let std::task::Poll::Ready((text, ok, _)) = fut.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) else {
+            panic!("a local batch must not wait on a runtime");
+        };
+        assert!(ok, "{text}");
+        assert!(text.contains("math: AC Commutative Algebra"), "{text}");
+        assert!(text.contains("Q1 Nature [phys]"), "{text}");
+    }
+
     #[test]
     fn next_day_rolls_over() {
         assert_eq!(next_day("2026-10-23"), "2026-10-24");

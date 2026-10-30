@@ -1,6 +1,6 @@
 //! Help text. Flags section is generated from the FLAGS table so docs cannot drift from the parser.
 
-use crate::args::FLAGS;
+use crate::args::{Flag, FLAGS};
 
 const HEAD: &str = "arx: arXiv for LLMs. `arx [CMD] ARGS FLAGS`; no CMD = search (a query starting with a command word needs `search`); ids alone = get.
 Rules: comma = OR, repeated flag = AND. Dates: 2024 | 2024-03 | 30d | 6m | 2y. Output dense: id|date|authors|cat|title.
@@ -19,22 +19,17 @@ CMDS
 
 /// Compact flag listing: names + metavars only, grouped (descriptions via `arx help flags`).
 pub fn full() -> String {
-    let mut s = String::from(HEAD);
+    let mut s = String::with_capacity(HEAD.len() + 600);
+    s.push_str(HEAD);
     let mut group = "";
     for f in FLAGS {
         if f.group != group {
             group = f.group;
-            s.push_str(&format!("\n{}:", group.to_ascii_uppercase()));
+            s.push('\n');
+            push_upper(&mut s, group);
+            s.push(':');
         }
-        s.push(' ');
-        if let Some(c) = f.short {
-            s.push_str(&format!("-{c}|"));
-        }
-        s.push_str(&format!("--{}", f.name));
-        if !f.arg.is_empty() {
-            s.push(' ');
-            s.push_str(f.arg);
-        }
+        push_flag(&mut s, f);
     }
     s.push_str("\nHelp: `arx help flags` (all flag meanings), `arx help CMD`.\n");
     s.push_str("EX arx x 'search -a \"terence tao\" -c math.NT --since 3y -n5 ; search sieve --published --q 1,2 | prob --kind conj,q'
@@ -42,24 +37,37 @@ pub fn full() -> String {
     s
 }
 
+fn push_upper(s: &mut String, t: &str) {
+    s.extend(t.chars().map(|c| c.to_ascii_uppercase()));
+}
+
+/// ` -n|--n N` / ` --flag`.
+fn push_flag(s: &mut String, f: &Flag) {
+    s.push(' ');
+    if let Some(c) = f.short {
+        s.push('-');
+        s.push(c);
+        s.push('|');
+    }
+    s.push_str("--");
+    s.push_str(f.name);
+    if !f.arg.is_empty() {
+        s.push(' ');
+        s.push_str(f.arg);
+    }
+}
+
 /// One line per flag with its meaning.
 pub fn flags_full() -> String {
-    let mut s = String::new();
+    let mut s = String::with_capacity(3072);
     let mut group = "";
     for f in FLAGS {
         if f.group != group {
             group = f.group;
-            s.push_str(&format!("{}\n", group.to_ascii_uppercase()));
+            push_upper(&mut s, group);
+            s.push('\n');
         }
-        s.push(' ');
-        if let Some(c) = f.short {
-            s.push_str(&format!("-{c}|"));
-        }
-        s.push_str(&format!("--{}", f.name));
-        if !f.arg.is_empty() {
-            s.push(' ');
-            s.push_str(f.arg);
-        }
+        push_flag(&mut s, f);
         s.push_str("  ");
         s.push_str(f.help);
         s.push('\n');

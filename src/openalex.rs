@@ -293,6 +293,7 @@ impl<'a> Parser<'a> {
         }
         self.i += 1;
         let mut words = Vec::new();
+        let mut positions = Vec::new();
         self.ws();
         if self.src.as_bytes().get(self.i) == Some(&b'}') {
             self.i += 1;
@@ -305,12 +306,8 @@ impl<'a> Parser<'a> {
             }
             let word = self.string(true)?.unwrap_or_default();
             self.eat(b':')?;
-            if let Val::Arr(positions) = self.value(depth + 1, true)? {
-                words.extend(positions.into_iter().filter_map(|p| match p {
-                    Val::Uint(p) => Some((p, word.clone())),
-                    _ => None,
-                }));
-            }
+            self.positions(depth + 1, &mut positions)?;
+            words.extend(positions.drain(..).map(|p| (p, word.clone())));
             self.ws();
             match self.src.as_bytes().get(self.i) {
                 Some(b',') => self.i += 1,
@@ -319,6 +316,40 @@ impl<'a> Parser<'a> {
                     return Ok(Val::Words(words));
                 }
                 _ => return Err(self.err("expected ',' or '}'")),
+            }
+        }
+    }
+
+    /// The value of one `abstract_inverted_index` entry: when it is an array, every unsigned integer in it is a
+    /// position (read like `value` would, but without a tree per word); other values are ignored.
+    fn positions(&mut self, depth: usize, out: &mut Vec<u64>) -> Result<(), String> {
+        if depth > MAX_DEPTH {
+            return Err(self.err("nesting too deep"));
+        }
+        self.ws();
+        let b = self.src.as_bytes();
+        if b.get(self.i) != Some(&b'[') {
+            self.value(depth, true)?;
+            return Ok(());
+        }
+        self.i += 1;
+        self.ws();
+        if b.get(self.i) == Some(&b']') {
+            self.i += 1;
+            return Ok(());
+        }
+        loop {
+            if let Val::Uint(p) = self.value(depth + 1, true)? {
+                out.push(p);
+            }
+            self.ws();
+            match b.get(self.i) {
+                Some(b',') => self.i += 1,
+                Some(b']') => {
+                    self.i += 1;
+                    return Ok(());
+                }
+                _ => return Err(self.err("expected ',' or ']'")),
             }
         }
     }
@@ -462,7 +493,19 @@ fn str_of<'v>(v: &'v Val, key: &str) -> Option<&'v str> {
 }
 
 fn squash(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    push_squashed(&mut out, s);
+    out
+}
+
+/// Append the whitespace-separated words of `s`, single-space joined to what `out` already holds.
+fn push_squashed(out: &mut String, s: &str) {
+    for w in s.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(w);
+    }
 }
 
 /// Byte offset right after the first ASCII-case-insensitive occurrence of `needle` (lowercase).
@@ -512,7 +555,9 @@ fn arxiv_id_from_url(u: &str) -> Option<String> {
 
 /// Every arXiv id a work carries: its top-level DOI, the primary location and all other locations.
 fn arxiv_ids(w: &Val) -> Vec<String> {
-    let from_loc = |l: &Val| ["landing_page_url", "pdf_url"].into_iter().filter_map(|k| str_of(l, k).and_then(arxiv_id_from_url)).collect::<Vec<_>>();
+    fn from_loc<'a>(l: &'a Val<'a>) -> impl Iterator<Item = String> + 'a {
+        ["landing_page_url", "pdf_url"].into_iter().filter_map(move |k| str_of(l, k).and_then(arxiv_id_from_url))
+    }
     let mut out: Vec<String> = Vec::new();
     let locs = w.get("locations").into_iter().flat_map(Val::items).flat_map(from_loc);
     let primary = w.get("primary_location").into_iter().flat_map(from_loc);
@@ -532,10 +577,9 @@ fn abstract_text(idx: &Val) -> String {
     ordered.sort_unstable_by_key(|(p, _)| *p);
     let mut out = String::with_capacity(ordered.iter().map(|(_, w)| w.len() + 1).sum());
     for (_, w) in ordered {
-        out.push_str(w);
-        out.push(' ');
+        push_squashed(&mut out, w);
     }
-    squash(&out)
+    out
 }
 
 fn date_part(s: &str) -> Option<&str> {
@@ -719,15 +763,17 @@ fn parse_response(json: &str, wanted: &[String], limit: usize) -> Result<Page, S
     };
     let items = &results.items()[..results.items().len().min(limit)];
     let rows = items.len();
-    let papers: Vec<Paper> = items
-        .iter()
-        .flat_map(|w| {
-            let ids = arxiv_ids(w);
-            let hit: Vec<String> = wanted.iter().filter(|x| ids.contains(x)).cloned().collect();
-            let ids = if hit.is_empty() { ids.into_iter().take(1).collect() } else { hit };
-            ids.into_iter().filter_map(|id| to_paper(w, id))
-        })
-        .collect();
+    let mut papers: Vec<Paper> = Vec::with_capacity(items.len());
+    for w in items {
+        let mut ids = arxiv_ids(w);
+        let hit: Vec<String> = wanted.iter().filter(|x| ids.contains(x)).cloned().collect();
+        if hit.is_empty() {
+            ids.truncate(1);
+        } else {
+            ids = hit;
+        }
+        papers.extend(ids.into_iter().filter_map(|id| to_paper(w, id)));
+    }
     let total = match v.get("meta").and_then(|m| m.get("count")) {
         Some(Val::Uint(n)) => *n as usize,
         _ => papers.len(),

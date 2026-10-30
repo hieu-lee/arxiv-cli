@@ -60,7 +60,8 @@ struct ApiGuard<'a> {
 }
 
 pub struct Net {
-    http: reqwest::Client,
+    /// Built on first fetch: TLS setup is wasted work for runs served from cache or without network.
+    http: std::sync::OnceLock<reqwest::Client>,
     sem: Semaphore,
     /// In-process spacing (always enforced, even when the cross-process stamp file is unusable).
     local_gate: tokio::sync::Mutex<Option<std::time::Instant>>,
@@ -102,6 +103,43 @@ pub fn data_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(d).join("arx"));
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share").join("arx"))
+}
+
+/// `DIR/<16 hex digits of h>` (plus `.tmp<pid>` for the staging file), built with a single allocation.
+fn entry_path(dir: &std::path::Path, h: u64, tmp_pid: Option<u32>) -> PathBuf {
+    let mut name = [0u8; 40];
+    for (i, d) in name[..16].iter_mut().enumerate() {
+        *d = b"0123456789abcdef"[(h >> (60 - 4 * i) & 0xf) as usize];
+    }
+    let mut len = 16;
+    if let Some(pid) = tmp_pid {
+        name[16..20].copy_from_slice(b".tmp");
+        let left = {
+            let mut rest = &mut name[20..];
+            let _ = write!(rest, "{pid}");
+            rest.len()
+        };
+        len = 40 - left;
+    }
+    let mut p = PathBuf::with_capacity(dir.as_os_str().len() + 1 + len);
+    p.push(dir);
+    p.push(std::str::from_utf8(&name[..len]).unwrap_or_default());
+    p
+}
+
+/// `write_all` of the concatenated `parts` with as few syscalls as the OS allows.
+fn write_all_parts(f: &mut fs::File, parts: &[&[u8]; 3]) -> std::io::Result<()> {
+    let slices = parts.map(std::io::IoSlice::new);
+    let mut skip = f.write_vectored(&slices)?;
+    for p in parts {
+        if skip >= p.len() {
+            skip -= p.len();
+        } else {
+            f.write_all(&p[skip..])?;
+            skip = 0;
+        }
+    }
+    Ok(())
 }
 
 fn fnv(s: &str) -> u64 {
@@ -193,15 +231,6 @@ const COOL_MAX_LEVEL: u32 = 6;
 
 impl Net {
     pub fn new(a: &Args) -> Result<Net, String> {
-        let http = reqwest::Client::builder()
-            .user_agent(UA)
-            .gzip(true)
-            .brotli(true)
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(60))
-            .pool_idle_timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("http client: {e}"))?;
         let par = a.num::<usize>("par").unwrap_or(4).clamp(1, 64);
         let via = match a.get("via") {
             Some(v) => Via::parse(v)?,
@@ -209,7 +238,7 @@ impl Net {
         };
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         Ok(Net {
-            http,
+            http: std::sync::OnceLock::new(),
             sem: Semaphore::new(par),
             local_gate: tokio::sync::Mutex::new(None),
             www_gate: tokio::sync::Mutex::new(None),
@@ -228,6 +257,22 @@ impl Net {
             oa_key: env("ARX_OPENALEX_KEY"),
             mailto: env("ARX_MAILTO"),
         })
+    }
+
+    fn client(&self) -> Result<&reqwest::Client, String> {
+        if let Some(c) = self.http.get() {
+            return Ok(c);
+        }
+        let c = reqwest::Client::builder()
+            .user_agent(UA)
+            .gzip(true)
+            .brotli(true)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(60))
+            .pool_idle_timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("http client: {e}"))?;
+        Ok(self.http.get_or_init(|| c))
     }
 
     /// Remember a caveat about where the answer came from (printed once, on stderr, by main).
@@ -273,7 +318,7 @@ impl Net {
     }
 
     fn cache_path(&self, url: &str) -> Option<PathBuf> {
-        self.dir.as_ref().map(|d| d.join(format!("{:016x}", fnv(url))))
+        self.dir.as_ref().map(|d| entry_path(d, fnv(url), None))
     }
 
     /// Ok(Some(Some(bytes))) hit, Ok(Some(None)) cached 404, None miss. `max_age`: None = any age (stale
@@ -283,38 +328,47 @@ impl Net {
             return None;
         }
         let p = self.cache_path(url)?;
+        if url.contains('\n') {
+            return None;
+        }
+        let mut file = fs::File::open(&p).ok()?;
+        let meta = file.metadata().ok()?;
         if let Some(ttl) = max_age {
-            let meta = fs::metadata(&p).ok()?;
             if meta.modified().ok()?.elapsed().ok()?.as_secs() > ttl {
                 return None;
             }
         }
-        let mut buf = Vec::new();
-        fs::File::open(&p).ok()?.read_to_end(&mut buf).ok()?;
-        let nl = buf.iter().position(|&b| b == b'\n')?;
-        if &buf[..nl] != url.as_bytes() {
+        // the entry is `URL\nBODY`: check the key, then read the body straight into its own buffer
+        let mut buf = Vec::with_capacity(meta.len() as usize);
+        buf.resize(url.len() + 1, 0);
+        file.read_exact(&mut buf).ok()?;
+        if buf[..url.len()] != *url.as_bytes() || buf[url.len()] != b'\n' {
             return None;
         }
-        let body = &buf[nl + 1..];
-        if body == b"\0404" {
+        buf.clear();
+        file.read_to_end(&mut buf).ok()?;
+        if buf == b"\0404" {
             return Some(None);
         }
-        Some(Some(body.to_vec()))
+        Some(Some(buf))
     }
 
     pub(crate) fn cache_put(&self, url: &str, body: Option<&[u8]>) {
-        let Some(p) = self.cache_path(url) else { return };
-        if let Some(d) = p.parent() {
-            let _ = fs::create_dir_all(d);
-        }
-        let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-        let ok = (|| -> std::io::Result<()> {
+        let Some(dir) = self.dir.as_deref() else { return };
+        let h = fnv(url);
+        let (p, tmp) = (entry_path(dir, h, None), entry_path(dir, h, Some(std::process::id())));
+        let write = || -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
-            f.write_all(url.as_bytes())?;
-            f.write_all(b"\n")?;
-            f.write_all(body.unwrap_or(b"\0404"))?;
-            Ok(())
-        })();
+            write_all_parts(&mut f, &[url.as_bytes(), b"\n", body.unwrap_or(b"\0404")])
+        };
+        let mut ok = write();
+        if ok.is_err() {
+            // first write into a fresh cache dir
+            if let Some(d) = p.parent() {
+                let _ = fs::create_dir_all(d);
+            }
+            ok = write();
+        }
         if ok.is_ok() {
             let _ = fs::rename(&tmp, &p);
         } else {
@@ -486,6 +540,7 @@ impl Net {
         let shown = strip_secrets(url);
         let api = key == "api";
         let started = crate::dates::unix_ms();
+        let http = self.client()?;
         let mut last_err = String::new();
         for attempt in 0..MAX_TRIES {
             let gate = if api { Some(self.gate().await) } else { None };
@@ -504,7 +559,7 @@ impl Net {
                 return Err(cooling(s));
             }
             let retry = attempt + 1 < MAX_TRIES;
-            match self.http.get(url).timeout(Duration::from_secs(if api { 30 } else { 60 })).send().await {
+            match http.get(url).timeout(Duration::from_secs(if api { 30 } else { 60 })).send().await {
                 Ok(r) => {
                     let st = r.status();
                     let retry_after = r
@@ -635,6 +690,14 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn entry_names_are_16_hex_digits_with_a_pid_suffix_when_staged() {
+        let d = std::path::Path::new("/c");
+        assert_eq!(entry_path(d, 0xabc, None), d.join("0000000000000abc"));
+        assert_eq!(entry_path(d, u64::MAX, Some(4242)), d.join("ffffffffffffffff.tmp4242"));
+        assert_eq!(entry_path(d, 1, Some(u32::MAX)), d.join("0000000000000001.tmp4294967295"));
     }
 
     #[test]

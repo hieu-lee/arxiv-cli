@@ -5,7 +5,7 @@
 //! index keyed by first token. Quartiles are approximate (see data/journals.tsv header).
 
 use crate::model::Venue;
-use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::{OnceLock, RwLock};
 
 static DATA: &str = include_str!("../data/journals.tsv");
@@ -27,9 +27,12 @@ struct Tok {
     flags: u8,
 }
 
+#[derive(Default)]
 struct Folded {
     buf: String,
     toks: Vec<Tok>,
+    /// Token under construction (kept to reuse its capacity across `fold_into` calls).
+    cur: String,
 }
 
 impl Folded {
@@ -46,6 +49,10 @@ impl Folded {
 }
 
 fn push_folded(c: char, out: &mut String) {
+    if c.is_ascii() {
+        out.push(c.to_ascii_lowercase());
+        return;
+    }
     for lc in c.to_lowercase() {
         let r = match lc {
             'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => 'a',
@@ -295,12 +302,35 @@ fn split_year_suffix(input: &str) -> std::borrow::Cow<'_, str> {
 }
 
 fn fold(input: &str) -> Folded {
+    let mut f = Folded::default();
+    fold_into(input, &mut f);
+    f
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Folded> = std::cell::RefCell::new(Folded::default());
+}
+
+/// Run `f` on the fold of `input`, reusing a per-thread buffer (matching runs once per paper).
+fn with_fold<R>(input: &str, f: impl FnOnce(&Folded) -> R) -> R {
+    SCRATCH.with(|s| match s.try_borrow_mut() {
+        Ok(mut s) => {
+            fold_into(input, &mut s);
+            f(&s)
+        }
+        Err(_) => f(&fold(input)),
+    })
+}
+
+/// `fold` into a reusable buffer.
+fn fold_into(input: &str, f: &mut Folded) {
     let input = &*split_year_suffix(input);
-    let mut f = Folded {
-        buf: String::with_capacity(input.len()),
-        toks: Vec::with_capacity(input.len() / 5 + 2),
-    };
-    let mut cur = String::new();
+    f.buf.clear();
+    f.toks.clear();
+    f.buf.reserve(input.len());
+    f.toks.reserve(input.len() / 5 + 2);
+    let mut cur = std::mem::take(&mut f.cur);
+    cur.clear();
     let (mut letters, mut upper, mut first_upper, mut digits_only, mut nchars) =
         (0u32, 0u32, false, true, 0u32);
     let mut prev_apos = false;
@@ -376,7 +406,7 @@ fn fold(input: &str) -> Folded {
                 &mut digits_only,
                 &mut nchars,
                 &mut prev_apos,
-                &mut f,
+                f,
             );
             if matches!(c, ',' | ';' | '(') {
                 if let Some(t) = f.toks.last_mut() {
@@ -385,18 +415,18 @@ fn fold(input: &str) -> Folded {
             }
         }
     }
-    f
+    f.cur = cur;
 }
 
 // ---------------------------------------------------------------------------------------------
 // Entries and index
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Alias {
     /// Written with a leading `^`: the restriction can never be relaxed by a duplicate alias.
     caret: bool,
-    toks: Vec<String>,
+    toks: &'static [&'static str],
     chars: u32,
     /// Alias is an ALLCAPS acronym: matching text token must be ALLCAPS too.
     upper: bool,
@@ -404,104 +434,217 @@ struct Alias {
     vol: bool,
 }
 
+/// Token and alias tables are leaked: the base table lives for the whole process and an overlay
+/// (`--qfile`) is loaded a handful of times at start-up.
 struct Entry {
     venue: Venue,
-    key: String,
-    name_toks: Vec<String>,
-    aliases: Vec<Alias>,
+    name_toks: &'static [&'static str],
+    aliases: &'static [Alias],
 }
 
-#[derive(Default)]
 struct Index {
     entries: Vec<Entry>,
-    first: HashMap<String, Vec<(u32, u32)>>,
+    /// (first token, alias chars, entry, alias) sorted by token, then longest alias first.
+    first: Vec<(&'static str, u32, u32, u32)>,
+    /// Open-addressing table over `first`: (start, len) of the run for a token, len 0 = empty slot.
+    slots: Vec<(u32, u32)>,
 }
 
-fn parse_alias(raw: &str) -> Option<Alias> {
+fn hash(t: &str) -> usize {
+    t.bytes().fold(0x811c9dc5u32, |h, b| (h ^ b as u32).wrapping_mul(0x0100_0193)) as usize
+}
+
+/// Result of `parse_alias`; the alias tokens stay in the scratch `Folded`.
+struct AliasInfo {
+    caret: bool,
+    chars: u32,
+    upper: bool,
+    vol: bool,
+}
+
+fn parse_alias(raw: &str, f: &mut Folded) -> Option<AliasInfo> {
     let raw = raw.trim();
     let free = raw.starts_with('!');
     let caret = raw.starts_with('^');
     let raw = raw.trim_start_matches(['!', '^']).trim();
-    let f = fold(raw);
+    fold_into(raw, f);
+    alias_info(raw, free, caret, f)
+}
+
+/// Classify the folded alias `raw` (`f` = its fold).
+fn alias_info(raw: &str, free: bool, caret: bool, f: &Folded) -> Option<AliasInfo> {
     let n = f.len();
     if n == 0 {
         return None;
     }
-    let toks: Vec<String> = (0..n).map(|i| f.text(i).to_string()).collect();
-    let chars = (toks.iter().map(String::len).sum::<usize>() + n - 1) as u32;
+    let chars = ((0..n).map(|i| f.text(i).len()).sum::<usize>() + n - 1) as u32;
     if n >= 2 {
-        return Some(Alias { toks, chars, upper: false, vol: caret, caret });
+        return Some(AliasInfo { chars, upper: false, vol: caret, caret });
     }
     let letters = raw.chars().filter(|c| c.is_alphabetic()).count();
     let raw_len = raw.chars().filter(|c| c.is_alphanumeric()).count();
     if f.flags(0) & F_UPPER != 0 && letters >= 3 {
-        Some(Alias { toks, chars, upper: true, vol: false, caret })
+        Some(AliasInfo { chars, upper: true, vol: false, caret })
     } else if f.flags(0) & F_UPPER != 0 && letters == 2 {
         // two-letter acronyms (CP, KR, EC) are too ambiguous without a following volume/year
-        Some(Alias { toks, chars, upper: true, vol: true, caret })
+        Some(AliasInfo { chars, upper: true, vol: true, caret })
     } else if raw_len >= 5 || (free && raw_len >= 3) {
-        Some(Alias { toks, chars, upper: false, vol: !free, caret })
+        Some(AliasInfo { chars, upper: false, vol: !free, caret })
     } else {
         None
     }
 }
 
-fn key_of(name: &str) -> (String, Vec<String>) {
-    let f = fold(name);
-    let toks: Vec<String> = (0..f.len()).map(|i| f.text(i).to_string()).collect();
-    (toks.join(" "), toks)
+fn folded_tokens(f: &Folded) -> impl Iterator<Item = &str> + Clone {
+    (0..f.len()).map(move |i| f.text(i))
 }
 
-fn add_alias(list: &mut Vec<Alias>, a: Alias) {
-    match list.iter_mut().find(|x| x.toks == a.toks) {
-        Some(x) if x.caret || a.caret => {
-            x.caret = true;
-            x.vol = true;
+/// Entries under construction: every folded token is stored once, back to back in `text`, and
+/// referenced by span; `finish` turns the spans into `'static` slices with a handful of allocations.
+#[derive(Default)]
+struct Build {
+    text: String,
+    spans: Vec<Span>,
+    aliases: Vec<(AliasInfo, Span)>,
+    /// venue, name tokens (into `spans`), aliases (into `aliases`)
+    entries: Vec<(Venue, Span, Span)>,
+}
+
+/// Half-open index range.
+type Span = (u32, u32);
+
+impl Build {
+    fn tok(&self, i: u32) -> &str {
+        let (s, e) = self.spans[i as usize];
+        &self.text[s as usize..e as usize]
+    }
+
+    fn push_toks<'a>(&mut self, toks: impl Iterator<Item = &'a str>) -> Span {
+        let start = self.spans.len() as u32;
+        for t in toks {
+            let s = self.text.len() as u32;
+            self.text.push_str(t);
+            self.spans.push((s, self.text.len() as u32));
         }
-        Some(x) => {
-            x.upper &= a.upper;
-            x.vol &= a.vol;
+        (start, self.spans.len() as u32)
+    }
+
+    /// Add an alias to the entry whose aliases start at `first`; an alias with the same tokens is merged.
+    fn add_alias<'a>(&mut self, first: usize, toks: impl Iterator<Item = &'a str> + Clone, a: AliasInfo) {
+        let dup = (first..self.aliases.len()).find(|&j| {
+            let (s, e) = self.aliases[j].1;
+            (s..e).map(|k| self.tok(k)).eq(toks.clone())
+        });
+        match dup {
+            Some(j) => {
+                let x = &mut self.aliases[j].0;
+                if x.caret || a.caret {
+                    x.caret = true;
+                    x.vol = true;
+                } else {
+                    x.upper &= a.upper;
+                    x.vol &= a.vol;
+                }
+            }
+            None => {
+                let span = self.push_toks(toks);
+                self.aliases.push((a, span));
+            }
         }
-        None => list.push(a),
+    }
+
+    fn add_entry(&mut self, name: &'static str, q: u8, area: &'static str, aliases: &str, inherited: &[Alias], f: &mut Folded) {
+        let clean = name.trim_start_matches(['!', '^']);
+        fold_into(clean, f);
+        let name_span = self.push_toks(folded_tokens(f));
+        let first = self.aliases.len();
+        // the name itself is the first alias; it folds like `clean` unless whitespace edges differ
+        let raw = name.trim();
+        let free = raw.starts_with('!');
+        let caret = raw.starts_with('^');
+        let raw = raw.trim_start_matches(['!', '^']).trim();
+        if raw.len() == clean.len() {
+            if let Some(a) = alias_info(raw, free, caret, f) {
+                self.aliases.push((a, name_span));
+            }
+        } else if let Some(a) = parse_alias(name, f) {
+            self.add_alias(first, folded_tokens(f), a);
+        }
+        for raw in aliases.split(';') {
+            if let Some(a) = parse_alias(raw, f) {
+                self.add_alias(first, folded_tokens(f), a);
+            }
+        }
+        for a in inherited {
+            let info = AliasInfo { caret: a.caret, chars: a.chars, upper: a.upper, vol: a.vol };
+            self.add_alias(first, a.toks.iter().copied(), info);
+        }
+        self.entries.push((Venue { name: clean, q, area }, name_span, (first as u32, self.aliases.len() as u32)));
+    }
+
+    fn finish(self) -> Vec<Entry> {
+        let text: &'static str = self.text.leak();
+        let pool: &'static [&'static str] = self.spans.iter().map(|&(s, e)| &text[s as usize..e as usize]).collect::<Vec<_>>().leak();
+        let slice = |(s, e): (u32, u32)| &pool[s as usize..e as usize];
+        let aliases: &'static [Alias] = self
+            .aliases
+            .iter()
+            .map(|(a, t)| Alias { caret: a.caret, toks: slice(*t), chars: a.chars, upper: a.upper, vol: a.vol })
+            .collect::<Vec<_>>()
+            .leak();
+        self.entries
+            .iter()
+            .map(|&(venue, name, al)| Entry { venue, name_toks: slice(name), aliases: &aliases[al.0 as usize..al.1 as usize] })
+            .collect()
     }
 }
 
-fn make_entry(
-    name: &'static str,
-    q: u8,
-    area: &'static str,
-    aliases: &str,
-    inherited: Vec<Alias>,
-) -> Entry {
-    let clean = name.trim_start_matches(['!', '^']);
-    let (key, name_toks) = key_of(clean);
-    let mut list: Vec<Alias> = Vec::new();
-    if let Some(a) = parse_alias(name) {
-        add_alias(&mut list, a);
-    }
-    for a in aliases.split(';').filter_map(parse_alias) {
-        add_alias(&mut list, a);
-    }
-    for a in inherited {
-        add_alias(&mut list, a);
-    }
-    Entry { venue: Venue { name: clean, q, area }, key, name_toks, aliases: list }
+fn make_entry(name: &'static str, q: u8, area: &'static str, aliases: &str, inherited: &[Alias]) -> Entry {
+    let mut b = Build::default();
+    b.add_entry(name, q, area, aliases, inherited, &mut Folded::default());
+    b.finish().pop().expect("one entry")
 }
 
 impl Index {
     fn build(entries: Vec<Entry>) -> Index {
-        let mut first: HashMap<String, Vec<(u32, u32)>> = HashMap::new();
+        let mut first = Vec::with_capacity(entries.iter().map(|e| e.aliases.len()).sum());
         for (ei, e) in entries.iter().enumerate() {
             for (ai, a) in e.aliases.iter().enumerate() {
-                first.entry(a.toks[0].clone()).or_default().push((ei as u32, ai as u32));
+                first.push((a.toks[0], a.chars, ei as u32, ai as u32));
             }
         }
-        for v in first.values_mut() {
-            v.sort_by_key(|&(ei, ai)| {
-                (std::cmp::Reverse(entries[ei as usize].aliases[ai as usize].chars), ei, ai)
-            });
+        first.sort_unstable_by_key(|&(t, chars, ei, ai)| (t, std::cmp::Reverse(chars), ei, ai));
+        let mut slots = vec![(0, 0); (first.len() * 2).next_power_of_two()];
+        let mask = slots.len() - 1;
+        let mut start = 0;
+        while start < first.len() {
+            let t = first[start].0;
+            let len = first[start..].partition_point(|x| x.0 == t);
+            let mut slot = hash(t) & mask;
+            while slots[slot].1 != 0 {
+                slot = (slot + 1) & mask;
+            }
+            slots[slot] = (start as u32, len as u32);
+            start += len;
         }
-        Index { entries, first }
+        Index { entries, first, slots }
+    }
+
+    /// Aliases starting with token `t`, longest first.
+    fn starting_with(&self, t: &str) -> &[(&'static str, u32, u32, u32)] {
+        let mask = self.slots.len() - 1;
+        let mut slot = hash(t) & mask;
+        loop {
+            let (start, len) = self.slots[slot];
+            if len == 0 {
+                return &[];
+            }
+            let run = &self.first[start as usize..(start + len) as usize];
+            if run[0].0 == t {
+                return run;
+            }
+            slot = (slot + 1) & mask;
+        }
     }
 }
 
@@ -513,43 +656,68 @@ struct Raw<'a> {
 }
 
 fn parse_tsv(tsv: &str) -> Result<Vec<Raw<'_>>, String> {
-    let mut out = Vec::new();
+    parse_lines(tsv, true)
+}
+
+/// `check_names`: reject names that fold to nothing (the embedded table is verified by a test instead).
+fn parse_lines(tsv: &str, check_names: bool) -> Result<Vec<Raw<'_>>, String> {
+    let mut out = Vec::with_capacity(tsv.len() / 64);
+    let mut f = Folded::default();
     for (ln, line) in tsv.lines().enumerate() {
         let line = line.trim_end_matches('\r');
         if line.trim().is_empty() || line.starts_with('#') {
             continue;
         }
-        let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 2 || cols.len() > 4 {
+        let mut cols = line.split('\t');
+        let (Some(name), Some(qcol)) = (cols.next(), cols.next()) else {
+            return Err(format!("line {}: expected name<TAB>q[<TAB>area][<TAB>aliases]", ln + 1));
+        };
+        let (c3, c4) = (cols.next(), cols.next());
+        if cols.next().is_some() {
             return Err(format!("line {}: expected name<TAB>q[<TAB>area][<TAB>aliases]", ln + 1));
         }
-        let name = cols[0].trim();
-        if key_of(name).1.is_empty() {
-            return Err(format!("line {}: empty name", ln + 1));
+        let name = name.trim();
+        if check_names {
+            fold_into(name, &mut f);
+            if f.len() == 0 {
+                return Err(format!("line {}: empty name", ln + 1));
+            }
         }
-        let q: u8 = match cols[1].trim().trim_start_matches(['q', 'Q']).parse() {
+        let q: u8 = match qcol.trim().trim_start_matches(['q', 'Q']).parse() {
             Ok(q @ 1..=4) => q,
-            _ => return Err(format!("line {}: q must be 1..4, got {:?}", ln + 1, cols[1])),
+            _ => return Err(format!("line {}: q must be 1..4, got {:?}", ln + 1, qcol)),
         };
-        let (area, aliases) = match cols.len() {
-            2 => (None, ""),
-            3 => (None, cols[2]),
-            _ => (Some(cols[2].trim()).filter(|a| !a.is_empty()), cols[3]),
+        let (area, aliases) = match (c3, c4) {
+            (None, _) => (None, ""),
+            (Some(a), None) => (None, a),
+            (Some(a), Some(al)) => (Some(a.trim()).filter(|a| !a.is_empty()), al),
         };
         out.push(Raw { name, q, area, aliases });
     }
     Ok(out)
 }
 
+fn base_raws() -> &'static [Raw<'static>] {
+    static RAWS: OnceLock<Vec<Raw<'static>>> = OnceLock::new();
+    RAWS.get_or_init(|| parse_lines(DATA, false).unwrap_or_default())
+}
+
 fn base() -> &'static Index {
     static BASE: OnceLock<Index> = OnceLock::new();
     BASE.get_or_init(|| {
-        let raws = parse_tsv(DATA).unwrap_or_default();
-        Index::build(
-            raws.into_iter()
-                .map(|r| make_entry(r.name, r.q, r.area.unwrap_or("other"), r.aliases, Vec::new()))
-                .collect(),
-        )
+        let raws = base_raws();
+        let n = raws.len();
+        let mut b = Build {
+            text: String::with_capacity(DATA.len() / 2),
+            spans: Vec::with_capacity(n * 6),
+            aliases: Vec::with_capacity(n * 3),
+            entries: Vec::with_capacity(n),
+        };
+        let mut f = Folded::default();
+        for r in raws {
+            b.add_entry(r.name, r.q, r.area.unwrap_or("other"), r.aliases, &[], &mut f);
+        }
+        Index::build(b.finish())
     })
 }
 
@@ -595,13 +763,12 @@ impl Index {
         }
         let mut best: Option<Cand> = None;
         for i in from..to {
-            let Some(cands) = self.first.get(f.text(i)) else { continue };
-            for &(ei, ai) in cands {
+            for &(_, _, ei, ai) in self.starting_with(f.text(i)) {
                 let e = &self.entries[ei as usize];
                 let a = &e.aliases[ai as usize];
                 let n = a.toks.len();
                 let end = i + n;
-                if end > to || a.toks.iter().enumerate().any(|(k, t)| f.text(i + k) != t) {
+                if end > to || a.toks.iter().enumerate().any(|(k, t)| f.text(i + k) != *t) {
                     continue;
                 }
                 if a.upper && f.flags(i) & F_UPPER == 0 {
@@ -748,7 +915,7 @@ fn visit(mut f: impl FnMut(&Entry)) {
         x.entries.iter().for_each(&mut f);
     }
     for e in &base().entries {
-        let shadowed = g.as_ref().is_some_and(|x| x.entries.iter().any(|o| o.key == e.key));
+        let shadowed = g.as_ref().is_some_and(|x| x.entries.iter().any(|o| o.name_toks == e.name_toks));
         if !shadowed {
             f(e);
         }
@@ -771,17 +938,17 @@ fn fuzzy(f: &Folded) -> Option<Venue> {
     }
     let mut best: Option<(f32, Venue)> = None;
     visit(|e| {
-        let v = &e.name_toks;
+        let v = e.name_toks;
         if v.len() > 64 || 10 * q.len().min(v.len()) < 9 * q.len().max(v.len()) {
             return;
         }
-        if !all_upper && e.aliases.iter().any(|a| a.upper && a.toks == *v) {
+        if !all_upper && e.aliases.iter().any(|a| a.upper && a.toks == v) {
             return;
         }
         let mut used = 0u64;
         let mut m = 0;
         for qt in &q {
-            if let Some(j) = (0..v.len()).find(|&j| used & (1 << j) == 0 && tok_close(qt, &v[j])) {
+            if let Some(j) = (0..v.len()).find(|&j| used & (1 << j) == 0 && tok_close(qt, v[j])) {
                 used |= 1 << j;
                 m += 1;
             }
@@ -796,16 +963,19 @@ fn fuzzy(f: &Folded) -> Option<Venue> {
 
 /// Best match for a free-text journal_ref ("Ann. of Math. 198 (2023) 1-50") or plain journal name.
 pub fn resolve(jref: &str) -> Option<Venue> {
-    let f = fold(jref);
+    with_fold(jref, |f| resolve_folded(jref, f))
+}
+
+fn resolve_folded(jref: &str, f: &Folded) -> Option<Venue> {
     if f.len() == 0 {
         return None;
     }
     let mode = Mode { relax_vol: false, need_year: false, pre_workshop: false };
-    if let Some(c) = find(&f, 0, f.len(), mode) {
+    if let Some(c) = find(f, 0, f.len(), mode) {
         return Some(c.venue);
     }
     if jref.len() < 80 {
-        fuzzy(&f)
+        fuzzy(f)
     } else {
         None
     }
@@ -911,7 +1081,10 @@ fn clauses(c: &str) -> Vec<&str> {
 }
 
 fn resolve_clause(comment: &str) -> Option<Venue> {
-    let f = fold(comment);
+    with_fold(comment, |f| clause_venue(comment, f))
+}
+
+fn clause_venue(comment: &str, f: &Folded) -> Option<Venue> {
     let n = f.len();
     if n == 0 {
         return None;
@@ -920,15 +1093,15 @@ fn resolve_clause(comment: &str) -> Option<Venue> {
     let cue_mode = Mode { relax_vol: true, need_year: false, pre_workshop: true };
     for i in 0..n {
         let start = match f.text(i) {
-            "accepted" | "appear" | "appears" | "appeared" | "published" | "forthcoming" | "press" if negated_at(&f, i) => continue,
+            "accepted" | "appear" | "appears" | "appeared" | "published" | "forthcoming" | "press" if negated_at(f, i) => continue,
             "accepted" | "appear" | "appears" | "appeared" | "published" | "forthcoming" | "press" => i + 1,
             "camera" if i + 1 < n && f.text(i + 1) == "ready" => i + 2,
-            "proc" if !(0..i).any(|k| pending_at(&f, k)) && !negated_from(&f, i, true) => i,
+            "proc" if !(0..i).any(|k| pending_at(f, k)) && !negated_from(f, i, true) => i,
             _ => continue,
         };
         let mut end = (start + 24).min(n);
         // an acceptance clause ends where a later "submitted/under review" clause begins
-        if let Some(j) = (start..end).find(|&j| pending_at(&f, j)) {
+        if let Some(j) = (start..end).find(|&j| pending_at(f, j)) {
             end = j;
         }
         if let Some(j) = (start..end.saturating_sub(1))
@@ -936,20 +1109,20 @@ fn resolve_clause(comment: &str) -> Option<Venue> {
         {
             end = j;
         }
-        let forward = if start < end { nearest(&f, start, end, cue_mode) } else { None };
+        let forward = if start < end { nearest(f, start, end, cue_mode) } else { None };
         if forward.is_some() {
             consider(&mut best, forward);
         } else {
             // postfix form: "Annals of Combinatorics, to appear" / "Journal X, In press"
-            consider(&mut best, find(&f, i.saturating_sub(12), i, cue_mode));
+            consider(&mut best, find(f, i.saturating_sub(12), i, cue_mode));
         }
     }
     // "Submitted to ICML 2024" / "under review at X" is not a publication
     let pending = raw_pending(comment) || (0..n).any(|i| {
-        pending_at(&f, i) || (matches!(f.text(i), "accepted" | "appear" | "appears" | "appeared" | "published" | "forthcoming" | "press") && negated_at(&f, i))
+        pending_at(f, i) || (matches!(f.text(i), "accepted" | "appear" | "appears" | "appeared" | "published" | "forthcoming" | "press") && negated_at(f, i))
     });
     if !pending && best.is_none() {
-        consider(&mut best, find(&f, 0, n, Mode { relax_vol: false, need_year: true, pre_workshop: true }));
+        consider(&mut best, find(f, 0, n, Mode { relax_vol: false, need_year: true, pre_workshop: true }));
     }
     best.map(|c| c.venue)
 }
@@ -973,7 +1146,7 @@ fn nearest(f: &Folded, start: usize, end: usize, mode: Mode) -> Option<Cand> {
     Some(best)
 }
 
-fn score(q: &[String], v: &[String]) -> f32 {
+fn score(q: &[&str], v: &[&str]) -> f32 {
     if q.is_empty() || v.is_empty() {
         return 0.0;
     }
@@ -983,17 +1156,22 @@ fn score(q: &[String], v: &[String]) -> f32 {
     if q.len() <= v.len() {
         if let Some(s) = (0..=v.len() - q.len()).find(|&s| v[s..s + q.len()] == *q) {
             let _ = s;
-            let qc: usize = q.iter().map(String::len).sum();
-            let vc: usize = v.iter().map(String::len).sum();
+            let qc: usize = q.iter().map(|t| t.len()).sum();
+            let vc: usize = v.iter().map(|t| t.len()).sum();
             return 0.7 + 0.29 * qc as f32 / vc as f32;
         }
     }
-    let mut used = vec![false; v.len()];
+    let mut stack = [false; 16];
+    let mut heap;
+    let used: &mut [bool] = if v.len() <= stack.len() {
+        &mut stack[..v.len()]
+    } else {
+        heap = vec![false; v.len()];
+        &mut heap
+    };
     let mut m = 0;
     for qt in q {
-        let hit = (0..v.len()).find(|&j| {
-            !used[j] && (*qt == v[j] || (qt.len() >= 3 && v[j].starts_with(qt.as_str())) || tok_close(qt, &v[j]))
-        });
+        let hit = (0..v.len()).find(|&j| !used[j] && (*qt == v[j] || (qt.len() >= 3 && v[j].starts_with(qt)) || tok_close(qt, v[j])));
         if let Some(j) = hit {
             used[j] = true;
             m += 1;
@@ -1005,7 +1183,7 @@ fn score(q: &[String], v: &[String]) -> f32 {
 /// Fuzzy name search for the `venue` command; best first.
 pub fn lookup(name: &str, limit: usize) -> Vec<(Venue, f32)> {
     let f = fold(name);
-    let q: Vec<String> = (0..f.len()).map(|i| f.text(i).to_string()).collect();
+    let q: Vec<&str> = folded_tokens(&f).collect();
     if q.is_empty() || limit == 0 {
         return Vec::new();
     }
@@ -1014,8 +1192,8 @@ pub fn lookup(name: &str, limit: usize) -> Vec<(Venue, f32)> {
         let s = e
             .aliases
             .iter()
-            .map(|a| score(&q, &a.toks))
-            .fold(score(&q, &e.name_toks), f32::max);
+            .map(|a| score(&q, a.toks))
+            .fold(score(&q, e.name_toks), f32::max);
         if s >= 0.5 {
             hits.push((e.venue, s));
         }
@@ -1036,12 +1214,14 @@ pub fn load_extra(tsv: &str) -> Result<usize, String> {
     let b = base();
     let mut g = EXTRA.write().unwrap_or_else(|e| e.into_inner());
     let mut entries: Vec<Entry> = g.take().map(|x| x.entries).unwrap_or_default();
+    let mut f = Folded::default();
     for r in raws {
-        let (key, _) = key_of(r.name.trim_start_matches(['!', '^']));
-        let old = b.entries.iter().find(|e| e.key == key);
+        fold_into(r.name.trim_start_matches(['!', '^']), &mut f);
+        let key: Vec<&str> = folded_tokens(&f).collect();
+        let old = b.entries.iter().find(|e| e.name_toks == key);
         let area = r.area.map(leak).or(old.map(|e| e.venue.area)).unwrap_or("extra");
-        let inherited = old.map(|e| e.aliases.clone()).unwrap_or_default();
-        entries.retain(|e| e.key != key);
+        let inherited = old.map_or(&[][..], |e| e.aliases);
+        entries.retain(|e| e.name_toks != key);
         entries.push(make_entry(leak(r.name), r.q, area, r.aliases, inherited));
     }
     *g = Some(Index::build(entries));
@@ -1053,14 +1233,28 @@ pub fn load_extra(tsv: &str) -> Result<usize, String> {
 pub fn list(q_mask: u8, area: Option<&str>) -> String {
     let area = area.map(str::to_lowercase);
     let mut rows: Vec<Venue> = Vec::new();
-    visit(|e| {
-        let v = e.venue;
-        if q_mask & (1 << (v.q - 1)) != 0 && area.as_deref().is_none_or(|a| v.area.to_lowercase().contains(a)) {
+    let mut take = |v: Venue| {
+        if q_mask & (1 << (v.q - 1)) != 0 && area.as_deref().is_none_or(|a| crate::taxonomy::contains_lower(v.area, a)) {
             rows.push(v);
         }
-    });
-    rows.sort_by(|a, b| a.q.cmp(&b.q).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
-    rows.iter().map(|v| format!("Q{} {} [{}]", v.q, v.name, v.area)).collect::<Vec<_>>().join("\n")
+    };
+    // without an overlay the table is only read, never folded
+    if EXTRA.read().unwrap_or_else(|e| e.into_inner()).is_none() {
+        for r in base_raws() {
+            take(Venue { name: r.name.trim_start_matches(['!', '^']), q: r.q, area: r.area.unwrap_or("other") });
+        }
+    } else {
+        visit(|e| take(e.venue));
+    }
+    rows.sort_by_cached_key(|v| (v.q, v.name.to_lowercase()));
+    let mut out = String::with_capacity(rows.len() * 40);
+    for (i, v) in rows.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let _ = write!(out, "Q{} {} [{}]", v.q, v.name, v.area);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1292,11 +1486,11 @@ mod tests {
         assert!(raws.iter().all(|r| r.area.is_some()));
         let b = base();
         assert_eq!(b.entries.len(), raws.len());
-        let mut seen: HashMap<&[String], &str> = HashMap::new();
+        let mut seen: std::collections::HashMap<&[&str], &str> = std::collections::HashMap::new();
         for e in &b.entries {
             assert!(!e.aliases.is_empty(), "{} has no alias", e.venue.name);
-            for a in &e.aliases {
-                if let Some(prev) = seen.insert(&a.toks, e.venue.name) {
+            for a in e.aliases {
+                if let Some(prev) = seen.insert(a.toks, e.venue.name) {
                     assert_eq!(prev, e.venue.name, "alias {:?} shared by two venues", a.toks);
                 }
             }

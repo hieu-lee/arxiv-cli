@@ -25,9 +25,18 @@ mod venue;
 static A: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() {
-    // the regex matcher recurses deeply; run the whole CLI on a large stack (worker threads get the same)
-    let h = std::thread::Builder::new().stack_size(64 << 20).spawn(real_main).expect("spawn main thread");
-    let code = h.join().unwrap_or(2);
+    let argv = match prepare() {
+        Ok(a) => a,
+        Err(code) => std::process::exit(code),
+    };
+    let local = pipe::all_local(&argv);
+    let code = if local {
+        run(argv, local)
+    } else {
+        // the regex matcher recurses deeply; run network commands on a large stack (worker threads get the same)
+        let h = std::thread::Builder::new().stack_size(64 << 20).spawn(move || run(argv, local)).expect("spawn main thread");
+        h.join().unwrap_or(2)
+    };
     std::process::exit(code);
 }
 
@@ -39,7 +48,8 @@ fn looks_like_command_line(s: &str) -> bool {
     pipe::canonical(first) == Some(first) && words.any(|w| w.starts_with('-') && w.len() > 1)
 }
 
-fn real_main() -> i32 {
+/// Command-line tokens to run, or the exit code when there is nothing left to do (help, bad input).
+fn prepare() -> Result<Vec<String>, i32> {
     use std::io::Write;
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.len() == 1 && argv[0].contains(char::is_whitespace) && (argv[0].contains([';', '|', '\n']) || looks_like_command_line(&argv[0])) {
@@ -47,21 +57,21 @@ fn real_main() -> i32 {
             Ok(t) => argv = t,
             Err(e) => {
                 eprintln!("error: {e}");
-                std::process::exit(2);
+                return Err(2);
             }
         }
     }
     // `arx x -` reads its statements from stdin; expand before engine flags are collected
     if argv.first().and_then(|w| pipe::canonical(w)) == Some("x") && argv.iter().filter(|t| *t == "-").count() > 1 {
         eprintln!("error: `-` (stdin) may appear only once");
-        return 2;
+        return Err(2);
     }
     if argv.first().and_then(|w| pipe::canonical(w)) == Some("x") && argv.iter().any(|t| t == "-") {
         let input = match pipe::read_stdin() {
             Ok(i) => i,
             Err(e) => {
                 eprintln!("error: {e}");
-                return 2;
+                return Err(2);
             }
         };
         for t in argv.iter_mut().skip(1) {
@@ -71,22 +81,23 @@ fn real_main() -> i32 {
         }
     }
     if argv.is_empty() || matches!(argv.as_slice(), [h] if h == "-h" || h == "--help") {
-        return match write!(std::io::stdout().lock(), "{}", help::full()) {
+        return Err(match write!(std::io::stdout().lock(), "{}", help::full()) {
             Err(e) if e.kind() != std::io::ErrorKind::BrokenPipe => {
                 eprintln!("error: write failed: {e}");
                 1
             }
             _ => 0,
-        };
+        });
     }
-    let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().thread_stack_size(64 << 20).build() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: runtime: {e}");
-            std::process::exit(2);
-        }
-    };
-    let code = rt.block_on(async {
+    Ok(argv)
+}
+
+/// `local`: every statement is a command that never touches the network, so the batch is a plain
+/// synchronous computation inside an async fn and needs no runtime.
+fn run(argv: Vec<String>, local: bool) -> i32 {
+    use std::future::Future;
+    use std::io::Write;
+    let main = async {
         // Flags are parsed per stage; global engine flags are read from the first stage's args.
         let probe = pipe::engine_flags(&argv);
         if let Err(e) = pipe::load_qfiles(&probe) {
@@ -122,6 +133,19 @@ fn real_main() -> i32 {
         } else {
             1
         }
-    });
-    code
+    };
+    let mut main = std::pin::pin!(main);
+    if local {
+        if let std::task::Poll::Ready(code) = main.as_mut().poll(&mut std::task::Context::from_waker(std::task::Waker::noop())) {
+            return code;
+        }
+    }
+    let mut rt = if local { tokio::runtime::Builder::new_current_thread() } else { tokio::runtime::Builder::new_multi_thread() };
+    match rt.enable_all().thread_stack_size(64 << 20).build() {
+        Ok(rt) => rt.block_on(main),
+        Err(e) => {
+            eprintln!("error: runtime: {e}");
+            std::process::exit(2);
+        }
+    }
 }

@@ -115,8 +115,9 @@ fn slug(s: &str) -> String {
     out
 }
 
-fn squash(s: &str) -> String {
-    s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()).collect()
+fn squash_into(s: &str, out: &mut String) {
+    out.clear();
+    out.extend(s.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_lowercase()));
 }
 
 /// Equal, or (both >= 5 chars and) edit distance <= 1.
@@ -124,11 +125,18 @@ fn near(a: &str, b: &str) -> bool {
     if a == b {
         return true;
     }
+    if a.is_ascii() && b.is_ascii() {
+        return near_by(a.as_bytes(), b.as_bytes());
+    }
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    near_by(&a, &b)
+}
+
+fn near_by<T: PartialEq>(a: &[T], b: &[T]) -> bool {
     if a.len() < 5 || b.len() < 5 || a.len().abs_diff(b.len()) > 1 {
         return false;
     }
-    let (s, l) = if a.len() <= b.len() { (&a, &b) } else { (&b, &a) };
+    let (s, l) = if a.len() <= b.len() { (a, b) } else { (b, a) };
     let i = s.iter().zip(l.iter()).take_while(|(x, y)| x == y).count();
     if s.len() == l.len() {
         s[i + 1..] == l[i + 1..]
@@ -150,8 +158,13 @@ pub fn tag(name: &str) -> Option<&'static Tag> {
     if let Some((_, t)) = TAG_ALIASES.iter().find(|(a, _)| *a == n) {
         return by(t);
     }
-    let sq = squash(&n);
-    if let Some(t) = TAGS.iter().find(|t| squash(t.name) == sq) {
+    let mut sq = String::new();
+    squash_into(&n, &mut sq);
+    let mut buf = String::new();
+    if let Some(t) = TAGS.iter().find(|t| {
+        squash_into(t.name, &mut buf);
+        buf == sq
+    }) {
         return Some(t);
     }
     if n.len() >= 3 {
@@ -160,12 +173,17 @@ pub fn tag(name: &str) -> Option<&'static Tag> {
         }
     }
     TAGS.iter()
-        .find(|t| near(&n, t.name) || near(&sq, &squash(t.name)))
+        .find(|t| {
+            near(&n, t.name) || {
+                squash_into(t.name, &mut buf);
+                near(&sq, &buf)
+            }
+        })
         .or_else(|| TAG_ALIASES.iter().find(|(a, _)| near(&n, a)).and_then(|(_, t)| by(t)))
 }
 
 pub fn list_tags() -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(TAGS.iter().map(|t| t.name.len() + t.desc.len() + 3).sum());
     for t in TAGS {
         if !out.is_empty() {
             out.push('\n');
